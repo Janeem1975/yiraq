@@ -54,6 +54,10 @@ def print_banner():
 """)
 
 
+# متغير عام لحفظ سريال الجهاز المستهدف
+DEVICE_SERIAL = None
+
+
 def run_cmd(cmd, capture=True, timeout=30):
     """تشغيل أمر مع التقاط المخرجات"""
     try:
@@ -65,6 +69,15 @@ def run_cmd(cmd, capture=True, timeout=30):
         return None
     except subprocess.TimeoutExpired:
         return None
+
+
+def adb_cmd(*args, timeout=30):
+    """تشغيل أمر ADB مع تحديد الجهاز تلقائياً بـ -s"""
+    cmd = ["adb"]
+    if DEVICE_SERIAL:
+        cmd.extend(["-s", DEVICE_SERIAL])
+    cmd.extend(args)
+    return run_cmd(cmd, timeout=timeout)
 
 
 def check_tool(name, install_cmd=None):
@@ -274,6 +287,8 @@ def step_2_start_device():
 
 def step_3_connect_adb(instance_name):
     """الخطوة 3: ربط ADB بالجهاز السحابي"""
+    global DEVICE_SERIAL
+
     print(f"\n{B}{'=' * 55}{RESET}")
     print(f"{B}  الخطوة 3: ربط ADB بالجهاز السحابي{RESET}")
     print(f"{B}{'=' * 55}{RESET}\n")
@@ -282,8 +297,23 @@ def step_3_connect_adb(instance_name):
 
     result = run_cmd(["gmsaas", "instances", "adbconnect", instance_name], timeout=60)
     if result and result.returncode == 0:
+        # استخراج سريال الجهاز من مخرجات gmsaas
+        output = result.stdout.strip()
         print(f"{G}[+] تم ربط ADB!{RESET}")
-        print(f"{C}    {result.stdout.strip()}{RESET}")
+        print(f"{C}    {output}{RESET}")
+
+        # gmsaas عادة يطبع السريال مثل "localhost:61178"
+        for line in output.split('\n'):
+            line = line.strip()
+            if line.startswith('localhost:') or ':' in line:
+                # استخراج السريال (مثل localhost:61178)
+                parts = line.split()
+                for part in parts:
+                    if 'localhost:' in part or (':' in part and part[0].isdigit()):
+                        DEVICE_SERIAL = part
+                        break
+                if DEVICE_SERIAL:
+                    break
     else:
         print(f"{R}[-] فشل ربط ADB{RESET}")
         if result:
@@ -298,6 +328,25 @@ def step_3_connect_adb(instance_name):
         print(f"\n{C}الأجهزة المتصلة:{RESET}")
         print(result.stdout)
 
+        # إذا ما قدرنا نستخرج السريال من gmsaas، نبحث عنه بقائمة الأجهزة
+        if not DEVICE_SERIAL:
+            for line in result.stdout.strip().split('\n'):
+                line = line.strip()
+                if 'localhost:' in line and 'device' in line:
+                    DEVICE_SERIAL = line.split()[0]
+                    break
+
+    if DEVICE_SERIAL:
+        print(f"{G}[+] سريال الجهاز المستهدف: {DEVICE_SERIAL}{RESET}")
+        print(f"{C}    كل أوامر ADB ستستهدف هذا الجهاز تحديداً{RESET}")
+    else:
+        print(f"{Y}[!] ما قدرت أحدد سريال الجهاز السحابي تلقائياً{RESET}")
+        serial_input = input(f"{Y}أدخل سريال الجهاز (مثل localhost:61178): {RESET}").strip()
+        if serial_input:
+            DEVICE_SERIAL = serial_input
+        else:
+            print(f"{Y}[!] سيتم استخدام ADB بدون تحديد جهاز — قد يستهدف جهاز خطأ{RESET}")
+
     return True
 
 
@@ -308,7 +357,7 @@ def step_4_install_app():
     print(f"{B}{'=' * 55}{RESET}\n")
 
     # التحقق هل التطبيق موجود
-    result = run_cmd(["adb", "shell", "pm", "list", "packages", PACKAGE_NAME])
+    result = adb_cmd("shell", "pm", "list", "packages", PACKAGE_NAME)
     if result and PACKAGE_NAME in result.stdout:
         print(f"{G}[+] تطبيق عين العراق موجود مسبقاً!{RESET}")
         return True
@@ -316,20 +365,22 @@ def step_4_install_app():
     print(f"{C}[*] التطبيق مش منصب — لازم تنصبه{RESET}")
     print(f"""
 {Y}الخيارات:{RESET}
-{C}  1. إذا عندك ملف APK:{RESET}
-{C}     adb install path/to/ayniq.apk{RESET}
-{C}  2. نزّل الـ APK من:{RESET}
+{C}  1. نزّل التطبيق من Google Play مباشرة على الجهاز السحابي{RESET}
+{C}     (إذا الجهاز يدعم Google Play){RESET}
+{C}  2. إذا عندك ملف APK:{RESET}
+{C}     adb {'-s ' + DEVICE_SERIAL + ' ' if DEVICE_SERIAL else ''}install path/to/ayniq.apk{RESET}
+{C}  3. نزّل الـ APK من:{RESET}
 {C}     - https://apkpure.com (ابحث عن عين العراق){RESET}
 {C}     - https://apkmirror.com{RESET}
 """)
 
-    apk_path = input(f"{Y}أدخل مسار ملف APK (أو Enter لتخطي): {RESET}").strip()
+    apk_path = input(f"{Y}أدخل مسار ملف APK (أو Enter لتخطي إذا نزّلته من Google Play): {RESET}").strip()
     if apk_path:
         # إزالة علامات التنصيص إذا موجودة
         apk_path = apk_path.strip('"').strip("'")
         if os.path.exists(apk_path):
             print(f"{C}[*] جاري تنصيب التطبيق...{RESET}")
-            result = run_cmd(["adb", "install", apk_path], timeout=120)
+            result = adb_cmd("install", apk_path, timeout=120)
             if result and result.returncode == 0:
                 print(f"{G}[+] تم تنصيب التطبيق بنجاح!{RESET}")
                 return True
@@ -342,7 +393,12 @@ def step_4_install_app():
             print(f"{R}[-] الملف غير موجود: {apk_path}{RESET}")
             return False
     else:
-        print(f"{Y}[!] تم التخطي — نصّب التطبيق يدوياً وأعد التشغيل{RESET}")
+        # التحقق مرة ثانية بعد التخطي (يمكن نزّله من Google Play)
+        result = adb_cmd("shell", "pm", "list", "packages", PACKAGE_NAME)
+        if result and PACKAGE_NAME in result.stdout:
+            print(f"{G}[+] تطبيق عين العراق موجود الآن!{RESET}")
+            return True
+        print(f"{Y}[!] تم التخطي — نصّب التطبيق من Google Play أو بملف APK وأعد التشغيل{RESET}")
         return False
 
 
@@ -353,18 +409,46 @@ def step_5_install_frida_server():
     print(f"{B}{'=' * 55}{RESET}\n")
 
     # التحقق هل Frida Server شغال
-    result = run_cmd(["adb", "shell", "su", "-c", "ps | grep frida-server"])
+    result = adb_cmd("shell", "su", "-c", "ps | grep frida-server")
     if result and "frida-server" in result.stdout:
         print(f"{G}[+] Frida Server شغال مسبقاً!{RESET}")
         return True
 
     # معرفة معمارية الجهاز
-    result = run_cmd(["adb", "shell", "getprop", "ro.product.cpu.abi"])
-    if not result:
-        print(f"{R}[-] ما قدرت أعرف معمارية الجهاز{RESET}")
-        return False
+    result = adb_cmd("shell", "getprop", "ro.product.cpu.abi")
+    arch = result.stdout.strip() if result else ""
 
-    arch = result.stdout.strip()
+    # إذا فشل الاستعلام الأول، جرب طرق بديلة
+    if not arch:
+        result = adb_cmd("shell", "getprop", "ro.product.cpu.abilist")
+        if result and result.stdout.strip():
+            # يرجع قائمة مثل "arm64-v8a,armeabi-v7a,armeabi" — ناخذ الأول
+            arch = result.stdout.strip().split(',')[0]
+
+    if not arch:
+        result = adb_cmd("shell", "uname", "-m")
+        if result and result.stdout.strip():
+            uname_arch = result.stdout.strip()
+            uname_map = {
+                "aarch64": "arm64-v8a",
+                "armv7l": "armeabi-v7a",
+                "x86_64": "x86_64",
+                "i686": "x86",
+                "i386": "x86",
+            }
+            arch = uname_map.get(uname_arch, uname_arch)
+
+    if not arch:
+        print(f"{Y}[!] ما قدرت أكتشف المعمارية تلقائياً{RESET}")
+        print(f"{Y}    اختر المعمارية:{RESET}")
+        print(f"{C}    1. arm64  (معظم أجهزة Genymotion الحديثة){RESET}")
+        print(f"{C}    2. x86_64{RESET}")
+        print(f"{C}    3. x86{RESET}")
+        print(f"{C}    4. arm{RESET}")
+        arch_choice = input(f"{Y}اختيارك (1-4): {RESET}").strip()
+        arch_fallback = {"1": "arm64-v8a", "2": "x86_64", "3": "x86", "4": "armeabi-v7a"}
+        arch = arch_fallback.get(arch_choice, "arm64-v8a")
+
     print(f"{C}[*] معمارية الجهاز: {arch}{RESET}")
 
     # تحديد اسم الملف
@@ -422,31 +506,36 @@ def step_5_install_frida_server():
 
     # دفع Frida Server للجهاز
     print(f"{C}[*] جاري دفع Frida Server للجهاز...{RESET}")
-    result = run_cmd(["adb", "push", frida_local, "/data/local/tmp/frida-server"], timeout=120)
+    result = adb_cmd("push", frida_local, "/data/local/tmp/frida-server", timeout=120)
     if not result or result.returncode != 0:
         print(f"{R}[-] فشل دفع الملف{RESET}")
         return False
 
     # تعيين الصلاحيات
-    run_cmd(["adb", "shell", "su", "-c", "chmod 755 /data/local/tmp/frida-server"])
+    adb_cmd("shell", "su", "-c", "chmod 755 /data/local/tmp/frida-server")
 
     # تشغيل Frida Server
     print(f"{C}[*] جاري تشغيل Frida Server...{RESET}")
+    adb_popen_cmd = ["adb"]
+    if DEVICE_SERIAL:
+        adb_popen_cmd.extend(["-s", DEVICE_SERIAL])
+    adb_popen_cmd.extend(["shell", "su", "-c", "/data/local/tmp/frida-server -D &"])
     subprocess.Popen(
-        ["adb", "shell", "su", "-c", "/data/local/tmp/frida-server -D &"],
+        adb_popen_cmd,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
     time.sleep(3)
 
     # التحقق
-    result = run_cmd(["adb", "shell", "su", "-c", "ps | grep frida-server"])
+    result = adb_cmd("shell", "su", "-c", "ps | grep frida-server")
     if result and "frida-server" in result.stdout:
         print(f"{G}[+] Frida Server شغال!{RESET}")
         return True
     else:
+        serial_flag = f"-s {DEVICE_SERIAL} " if DEVICE_SERIAL else ""
         print(f"{Y}[!] ما قدرت أتحقق — جرب يدوياً:{RESET}")
-        print(f"{C}    adb shell su -c '/data/local/tmp/frida-server &'{RESET}")
+        print(f"{C}    adb {serial_flag}shell su -c '/data/local/tmp/frida-server &'{RESET}")
         return True  # نكمل على أمل إنه شغال
 
 
@@ -472,11 +561,16 @@ def step_6_extract_token():
 
     # إيقاف التطبيق أولاً لضمان تحميل التجاوز من البداية
     print(f"{C}[*] جاري إيقاف التطبيق (إذا شغال)...{RESET}")
-    run_cmd(["adb", "shell", "am", "force-stop", PACKAGE_NAME])
+    adb_cmd("shell", "am", "force-stop", PACKAGE_NAME)
     time.sleep(1)
 
     print(f"{C}[*] جاري تشغيل التطبيق مع Frida...{RESET}")
-    frida_cmd = ["frida", "-U", "-f", PACKAGE_NAME, "-l", script_to_use]
+    # استخدام -D بدل -U لتحديد الجهاز بالسريال
+    if DEVICE_SERIAL:
+        frida_cmd = ["frida", "-D", DEVICE_SERIAL, "-f", PACKAGE_NAME, "-l", script_to_use]
+        print(f"{C}[*] Frida يستهدف الجهاز: {DEVICE_SERIAL}{RESET}")
+    else:
+        frida_cmd = ["frida", "-U", "-f", PACKAGE_NAME, "-l", script_to_use]
 
     print(f"{C}[*] سوي أي عملية بالتطبيق عشان يرسل طلب ويظهر التوكن{RESET}")
     print(f"{Y}[*] اضغط Ctrl+C لإيقاف المراقبة وسحب التوكن{RESET}\n")
@@ -505,7 +599,7 @@ def step_6_extract_token():
 
     # محاولة سحب الملف
     time.sleep(1)
-    result = run_cmd(["adb", "pull", TOKEN_FILE_ON_DEVICE, LOCAL_TOKEN_FILE])
+    result = adb_cmd("pull", TOKEN_FILE_ON_DEVICE, LOCAL_TOKEN_FILE)
     if result and result.returncode == 0 and os.path.exists(LOCAL_TOKEN_FILE):
         with open(LOCAL_TOKEN_FILE, "r") as f:
             token = f.read().strip()
