@@ -37,6 +37,7 @@ RESET = '\033[0m'
 
 PACKAGE_NAME = "com.moi.ayniq"
 FRIDA_SCRIPT = os.path.join(os.path.dirname(__file__), "hook_appcheck.js")
+BYPASS_SCRIPT = os.path.join(os.path.dirname(__file__), "bypass_emulator.js")
 TOKEN_FILE_ON_DEVICE = "/sdcard/appcheck_token.txt"
 LOCAL_TOKEN_FILE = os.path.join(os.path.dirname(__file__), "appcheck_token.txt")
 
@@ -455,20 +456,27 @@ def step_6_extract_token():
     print(f"{B}  الخطوة 6: سحب التوكن من تطبيق عين العراق{RESET}")
     print(f"{B}{'=' * 55}{RESET}\n")
 
-    if not os.path.exists(FRIDA_SCRIPT):
-        print(f"{R}[-] ملف hook_appcheck.js غير موجود!{RESET}")
+    # اختيار السكربت — تجاوز كشف المحاكي تلقائياً على الأجهزة السحابية
+    use_bypass = os.path.exists(BYPASS_SCRIPT)
+    script_to_use = BYPASS_SCRIPT if use_bypass else FRIDA_SCRIPT
+
+    if not os.path.exists(script_to_use):
+        print(f"{R}[-] ملف السكربت غير موجود!{RESET}")
         return False
 
-    # التحقق هل التطبيق شغال
-    result = run_cmd(["adb", "shell", "pidof", PACKAGE_NAME])
-    app_running = result and bool(result.stdout.strip())
-
-    if app_running:
-        print(f"{G}[+] التطبيق شغال — جاري الربط...{RESET}")
-        frida_cmd = ["frida", "-U", PACKAGE_NAME, "-l", FRIDA_SCRIPT]
+    if use_bypass:
+        print(f"{G}[+] سيتم استخدام سكربت تجاوز كشف المحاكي تلقائياً{RESET}")
+        print(f"{C}[*] هذا يمنع التطبيق من كشف الجهاز السحابي كمحاكي{RESET}")
     else:
-        print(f"{C}[*] جاري تشغيل التطبيق مع Frida...{RESET}")
-        frida_cmd = ["frida", "-U", "-f", PACKAGE_NAME, "-l", FRIDA_SCRIPT]
+        print(f"{Y}[!] سكربت تجاوز المحاكي غير موجود — سيتم استخدام السكربت العادي{RESET}")
+
+    # إيقاف التطبيق أولاً لضمان تحميل التجاوز من البداية
+    print(f"{C}[*] جاري إيقاف التطبيق (إذا شغال)...{RESET}")
+    run_cmd(["adb", "shell", "am", "force-stop", PACKAGE_NAME])
+    time.sleep(1)
+
+    print(f"{C}[*] جاري تشغيل التطبيق مع Frida...{RESET}")
+    frida_cmd = ["frida", "-U", "-f", PACKAGE_NAME, "-l", script_to_use]
 
     print(f"{C}[*] سوي أي عملية بالتطبيق عشان يرسل طلب ويظهر التوكن{RESET}")
     print(f"{Y}[*] اضغط Ctrl+C لإيقاف المراقبة وسحب التوكن{RESET}\n")

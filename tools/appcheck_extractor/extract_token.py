@@ -26,6 +26,7 @@ from pathlib import Path
 
 PACKAGE_NAME = "com.moi.ayniq"
 FRIDA_SCRIPT = os.path.join(os.path.dirname(__file__), "hook_appcheck.js")
+BYPASS_SCRIPT = os.path.join(os.path.dirname(__file__), "bypass_emulator.js")
 TOKEN_FILE_ON_DEVICE = "/sdcard/appcheck_token.txt"
 LOCAL_TOKEN_FILE = "appcheck_token.txt"
 
@@ -121,6 +122,17 @@ def method_frida():
 
     print(f"{G}[+] frida-server شغال!{RESET}")
 
+    # اختيار السكربت (عادي أو مع تجاوز كشف المحاكي)
+    use_bypass = False
+    if os.path.exists(BYPASS_SCRIPT):
+        print(f"\n{Y}[?] هل التطبيق يكشف المحاكي ويرفض يشتغل؟{RESET}")
+        bypass_choice = input(f"{Y}    استخدم سكربت تجاوز كشف المحاكي؟ (y/n): {RESET}").strip().lower()
+        use_bypass = bypass_choice == 'y'
+
+    script_to_use = BYPASS_SCRIPT if use_bypass else FRIDA_SCRIPT
+    if use_bypass:
+        print(f"{G}[+] سيتم استخدام سكربت تجاوز كشف المحاكي{RESET}")
+
     # التحقق هل التطبيق مفتوح
     check_running = subprocess.run(
         ["adb", "shell", "pidof", PACKAGE_NAME],
@@ -131,11 +143,11 @@ def method_frida():
     if app_running:
         print(f"{G}[+] تطبيق عين العراق شغال (PID: {check_running.stdout.strip()}){RESET}")
         print(f"{C}[*] جاري الربط مع التطبيق...{RESET}")
-        frida_cmd = ["frida", "-U", PACKAGE_NAME, "-l", FRIDA_SCRIPT]
+        frida_cmd = ["frida", "-U", PACKAGE_NAME, "-l", script_to_use]
     else:
         print(f"{Y}[!] التطبيق مش مفتوح — سيتم تشغيله تلقائياً بواسطة Frida{RESET}")
         print(f"{C}[*] جاري تشغيل التطبيق مع Frida...{RESET}")
-        frida_cmd = ["frida", "-U", "-f", PACKAGE_NAME, "-l", FRIDA_SCRIPT]
+        frida_cmd = ["frida", "-U", "-f", PACKAGE_NAME, "-l", script_to_use]
 
     print(f"{C}[*] سوي أي عملية بالتطبيق (مثل OTP أو حجز) عشان يرسل طلب ويظهر التوكن{RESET}")
     print(f"{Y}[*] اضغط Ctrl+C لإيقاف المراقبة{RESET}\n")
@@ -412,6 +424,75 @@ def method_logcat():
         process.terminate()
 
 
+def method_frida_bypass():
+    """الطريقة 5: Frida مع تجاوز كشف المحاكي"""
+    print(f"\n{B}=== الطريقة 5: Frida + تجاوز كشف المحاكي ==={RESET}\n")
+
+    try:
+        import frida
+    except ImportError:
+        print(f"{R}[-] Frida غير منصب!{RESET}")
+        print(f"{Y}    نصّبه: pip install frida-tools{RESET}")
+        return False
+
+    if not os.path.exists(BYPASS_SCRIPT):
+        print(f"{R}[-] ملف تجاوز المحاكي غير موجود: {BYPASS_SCRIPT}{RESET}")
+        return False
+
+    # التحقق من frida-server على الجهاز
+    print(f"{C}[*] التحقق من frida-server على الجهاز...{RESET}")
+    result = subprocess.run(
+        ["adb", "shell", "su", "-c", "ps | grep frida"],
+        capture_output=True, text=True, timeout=10
+    )
+
+    if "frida" not in result.stdout.lower():
+        print(f"{Y}[!] frida-server غير شغال على الجهاز{RESET}")
+        print(f"{Y}    شغّله أولاً:{RESET}")
+        print(f"{Y}       adb shell su -c '/data/local/tmp/frida-server &'{RESET}")
+        return False
+
+    print(f"{G}[+] frida-server شغال!{RESET}")
+    print(f"{G}[+] سيتم استخدام سكربت تجاوز كشف المحاكي + سحب التوكن{RESET}")
+
+    # إيقاف التطبيق أولاً لضمان تشغيله مع Frida من البداية
+    print(f"{C}[*] جاري إيقاف التطبيق (إذا شغال) لضمان تحميل التجاوز من البداية...{RESET}")
+    subprocess.run(["adb", "shell", "am", "force-stop", PACKAGE_NAME],
+                   capture_output=True, timeout=10)
+    time.sleep(1)
+
+    print(f"{C}[*] جاري تشغيل التطبيق مع تجاوز كشف المحاكي...{RESET}")
+    frida_cmd = ["frida", "-U", "-f", PACKAGE_NAME, "-l", BYPASS_SCRIPT]
+
+    print(f"{C}[*] انتظر التطبيق يفتح — المفروض يشتغل بدون ما يكشف المحاكي{RESET}")
+    print(f"{C}[*] سوي أي عملية بالتطبيق عشان يرسل طلب ويظهر التوكن{RESET}")
+    print(f"{Y}[*] اضغط Ctrl+C لإيقاف المراقبة{RESET}\n")
+
+    try:
+        process = subprocess.Popen(
+            frida_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+
+        for line in process.stdout:
+            print(line, end="")
+            if "APP CHECK TOKEN" in line:
+                print(f"\n{G}[+] تم العثور على التوكن!{RESET}")
+
+    except KeyboardInterrupt:
+        print(f"\n{Y}[*] تم إيقاف المراقبة{RESET}")
+        try:
+            process.terminate()
+        except Exception:
+            pass
+
+    # محاولة سحب الملف من الجهاز
+    pull_token_from_device()
+    return True
+
+
 def main():
     print_banner()
 
@@ -439,6 +520,7 @@ def main():
         print(f"  {C}2{RESET} - mitmproxy (اعتراض الترافيك)")
         print(f"  {C}3{RESET} - سحب التوكن المحفوظ من الجهاز")
         print(f"  {C}4{RESET} - مراقبة Logcat")
+        print(f"  {C}5{RESET} - Frida + تجاوز كشف المحاكي (إذا التطبيق يرفض يشتغل)")
         print(f"  {C}0{RESET} - خروج")
 
         choice = input(f"\n{Y}اختيارك: {RESET}").strip()
@@ -451,6 +533,8 @@ def main():
             method_adb_pull()
         elif choice == "4":
             method_logcat()
+        elif choice == "5":
+            method_frida_bypass()
         elif choice == "0":
             print(f"{C}مع السلامة!{RESET}")
             break
