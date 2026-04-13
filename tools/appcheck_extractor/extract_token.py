@@ -120,14 +120,29 @@ def method_frida():
         return False
 
     print(f"{G}[+] frida-server شغال!{RESET}")
-    print(f"{C}[*] جاري ربط Frida مع تطبيق عين العراق...{RESET}")
-    print(f"{C}[*] افتح التطبيق وسوي أي عملية (مثل OTP أو حجز) عشان يرسل طلب ويظهر التوكن{RESET}")
+
+    # التحقق هل التطبيق مفتوح
+    check_running = subprocess.run(
+        ["adb", "shell", "pidof", PACKAGE_NAME],
+        capture_output=True, text=True, timeout=10
+    )
+    app_running = bool(check_running.stdout.strip())
+
+    if app_running:
+        print(f"{G}[+] تطبيق عين العراق شغال (PID: {check_running.stdout.strip()}){RESET}")
+        print(f"{C}[*] جاري الربط مع التطبيق...{RESET}")
+        frida_cmd = ["frida", "-U", PACKAGE_NAME, "-l", FRIDA_SCRIPT]
+    else:
+        print(f"{Y}[!] التطبيق مش مفتوح — سيتم تشغيله تلقائياً بواسطة Frida{RESET}")
+        print(f"{C}[*] جاري تشغيل التطبيق مع Frida...{RESET}")
+        frida_cmd = ["frida", "-U", "-f", PACKAGE_NAME, "-l", FRIDA_SCRIPT]
+
+    print(f"{C}[*] سوي أي عملية بالتطبيق (مثل OTP أو حجز) عشان يرسل طلب ويظهر التوكن{RESET}")
     print(f"{Y}[*] اضغط Ctrl+C لإيقاف المراقبة{RESET}\n")
 
     try:
-        # تشغيل frida مباشرة
         process = subprocess.Popen(
-            ["frida", "-U", PACKAGE_NAME, "-l", FRIDA_SCRIPT],
+            frida_cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True
@@ -135,7 +150,6 @@ def method_frida():
 
         for line in process.stdout:
             print(line, end="")
-            # إذا تم العثور على التوكن
             if "APP CHECK TOKEN" in line:
                 print(f"\n{G}[+] تم العثور على التوكن! تحقق من الملف: {LOCAL_TOKEN_FILE}{RESET}")
 
