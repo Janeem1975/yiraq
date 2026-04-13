@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ملفات المشروع كاملة</title>
+  <style>
+    :root {
+      --bg1: #f5f7fb;
+      --bg2: #e8eef9;
+      --card: #ffffff;
+      --text: #0f172a;
+      --muted: #475569;
+      --blue: #2563eb;
+      --green: #16a34a;
+      --red: #dc2626;
+      --line: #dbe4f0;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Cairo", "Noto Kufi Arabic", Tahoma, Arial, sans-serif;
+      color: var(--text);
+      background: radial-gradient(1200px 700px at 90% -10%, #dbeafe, transparent 60%),
+                  radial-gradient(1000px 600px at 0% 110%, #dcfce7, transparent 60%),
+                  linear-gradient(180deg, var(--bg1), var(--bg2));
+      min-height: 100vh;
+      padding: 24px;
+    }
+    .wrap {
+      max-width: 980px;
+      margin: 0 auto;
+      display: grid;
+      gap: 16px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 8px 24px rgba(15, 23, 42, 0.06);
+    }
+    h1, h2 { margin: 0 0 10px; }
+    p { margin: 0; color: var(--muted); line-height: 1.8; }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+    a.tile {
+      display: block;
+      text-decoration: none;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      background: #f8fbff;
+      color: var(--text);
+      transition: transform .12s ease, box-shadow .12s ease;
+    }
+    a.tile:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 6px 16px rgba(37, 99, 235, .15);
+    }
+    .tag {
+      display: inline-block;
+      margin-top: 6px;
+      font-size: 12px;
+      padding: 4px 8px;
+      border-radius: 999px;
+      color: white;
+      background: var(--blue);
+    }
+    .ok { background: var(--green); }
+    .warn { background: var(--red); }
+    code {
+      background: #eef2ff;
+      border: 1px solid #dbeafe;
+      border-radius: 6px;
+      padding: 2px 6px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="card">
+      <h1>ملفات المشروع كاملة</h1>
+      <p>
+        هذه الصفحة لعرض وحفظ مشروع الحجز بالكامل على Hugging Face.
+        ستجد هنا الكود، السكربت، والشرح التفصيلي لكل جزء.
+      </p>
+      <span class="tag ok">أرشفة كاملة للمشروع</span>
+      <span class="tag">عرض الشرح من المتصفح</span>
+    </section>
+
+    <section class="card">
+      <h2>روابط مباشرة للشرح</h2>
+      <div class="grid">
+        <a class="tile" target="_blank" href="https://huggingface.co/spaces/ainalsaker2/malafat-almashrooaa-kamela/blob/main/docs/CODEBASE_EXPLAINED_AR.md">
+          شرح هيكل الكود
+          <span class="tag">CODEBASE_EXPLAINED_AR.md</span>
+        </a>
+        <a class="tile" target="_blank" href="https://huggingface.co/spaces/ainalsaker2/malafat-almashrooaa-kamela/blob/main/docs/SCRIPT_DETAILS_AR.md">
+          شرح السكربت
+          <span class="tag">SCRIPT_DETAILS_AR.md</span>
+        </a>
+        <a class="tile" target="_blank" href="https://huggingface.co/spaces/ainalsaker2/malafat-almashrooaa-kamela/blob/main/docs/DASHBOARD_GUIDE_AR.md">
+          شرح الداش بورد
+          <span class="tag">DASHBOARD_GUIDE_AR.md</span>
+        </a>
+        <a class="tile" target="_blank" href="https://huggingface.co/spaces/ainalsaker2/malafat-almashrooaa-kamela/blob/main/docs/CODE_PROTECTION_GUIDE_AR.md">
+          حماية الكود من السرقة
+          <span class="tag">CODE_PROTECTION_GUIDE_AR.md</span>
+        </a>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>روابط ملفات المشروع</h2>
+      <div class="grid">
+        <a class="tile" target="_blank" href="https://huggingface.co/spaces/ainalsaker2/malafat-almashrooaa-kamela/tree/main/app">
+          كود تطبيق Android
+          <span class="tag">app/</span>
+        </a>
+        <a class="tile" target="_blank" href="https://huggingface.co/spaces/ainalsaker2/malafat-almashrooaa-kamela/blob/main/fixed_script.py">
+          سكربت البحث والحجز
+          <span class="tag">fixed_script.py</span>
+        </a>
+        <a class="tile" target="_blank" href="https://huggingface.co/spaces/ainalsaker2/malafat-almashrooaa-kamela/tree/main/control_server">
+          كود الداش بورد (FastAPI)
+          <span class="tag">control_server/</span>
+        </a>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>ملاحظات</h2>
+      <p>
+        السبيس دي محفوظة كـ <code>Static Space</code> لعرض الملفات والشرح فقط.
+        لا يتم تشغيل تطبيق Android نفسه داخل Hugging Face.
+      </p>
+      <span class="tag warn">الغرض: حفظ + توثيق</span>
+    </section>
+  </main>
+</body>
+</html>
