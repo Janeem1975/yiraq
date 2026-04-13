@@ -495,24 +495,76 @@ def step_5_install_frida_server():
             print(f"{G}[+] تم فك الضغط!{RESET}")
         except Exception as e:
             print(f"{R}[-] فشل التنزيل: {e}{RESET}")
-            print(f"{Y}    نزّله يدوياً من:{RESET}")
-            print(f"{C}    https://github.com/frida/frida/releases/tag/{FRIDA_VERSION}{RESET}")
-            print(f"{C}    اختر: {frida_xz}{RESET}")
-            manual = input(f"{Y}أدخل مسار الملف بعد التنزيل (أو Enter للإلغاء): {RESET}").strip()
-            if manual and os.path.exists(manual):
-                frida_local = manual
+            print(f"")
+            print(f"{Y}    === تعليمات التنزيل اليدوي ==={RESET}")
+            print(f"{C}    1. افتح هذا الرابط بالمتصفح:{RESET}")
+            print(f"{B}       https://github.com/frida/frida/releases/download/{FRIDA_VERSION}/{frida_xz}{RESET}")
+            print(f"{C}    2. بعد التنزيل، فك الضغط بـ 7-Zip:{RESET}")
+            print(f"{C}       كلك يمين على الملف → 7-Zip → Extract Here{RESET}")
+            print(f"{C}    3. المفروض يطلع ملف اسمه: {frida_filename}{RESET}")
+            print(f"{C}       (بدون .xz بالآخر){RESET}")
+            print(f"{C}    4. الصق مسار الملف المفكوك هنا{RESET}")
+            print(f"")
+            print(f"{Y}    ملاحظة: الملف لازم يكون المفكوك (بدون .xz){RESET}")
+            print(f"{Y}    إذا أعطيت ملف .xz بنفكه تلقائياً{RESET}")
+            manual = input(f"{Y}أدخل مسار الملف (أو Enter للإلغاء): {RESET}").strip()
+            if manual:
+                manual = manual.strip('"').strip("'")
+                if not os.path.exists(manual):
+                    print(f"{R}[-] الملف غير موجود: {manual}{RESET}")
+                    return False
+                # إذا الملف بصيغة .xz، نفكه
+                if manual.endswith('.xz'):
+                    print(f"{C}[*] جاري فك الضغط...{RESET}")
+                    try:
+                        import lzma
+                        with lzma.open(manual) as f_in:
+                            with open(frida_local, 'wb') as f_out:
+                                f_out.write(f_in.read())
+                        print(f"{G}[+] تم فك الضغط!{RESET}")
+                    except Exception as ex:
+                        print(f"{R}[-] فشل فك الضغط: {ex}{RESET}")
+                        return False
+                else:
+                    frida_local = manual
             else:
                 return False
+
+    # التحقق من حجم الملف (frida-server عادة > 10MB)
+    file_size = os.path.getsize(frida_local)
+    if file_size < 1_000_000:  # أقل من 1MB — غالباً ملف خطأ
+        print(f"{R}[-] حجم الملف صغير جداً ({file_size} bytes) — غالباً مش ملف frida-server الصحيح{RESET}")
+        print(f"{Y}    الملف الصحيح حجمه أكبر من 10MB بعد فك الضغط{RESET}")
+        return False
+
+    print(f"{G}[+] حجم الملف: {file_size / 1024 / 1024:.1f} MB — يبدو صحيح{RESET}")
+
+    # إيقاف أي frida-server قديم
+    adb_cmd("shell", "su", "-c", "pkill -f frida-server 2>/dev/null")
+    time.sleep(1)
 
     # دفع Frida Server للجهاز
     print(f"{C}[*] جاري دفع Frida Server للجهاز...{RESET}")
     result = adb_cmd("push", frida_local, "/data/local/tmp/frida-server", timeout=120)
     if not result or result.returncode != 0:
         print(f"{R}[-] فشل دفع الملف{RESET}")
+        if result:
+            print(f"{R}    {result.stderr}{RESET}")
         return False
+
+    print(f"{G}[+] تم دفع الملف!{RESET}")
 
     # تعيين الصلاحيات
     adb_cmd("shell", "su", "-c", "chmod 755 /data/local/tmp/frida-server")
+
+    # التحقق من وجود الملف على الجهاز
+    result = adb_cmd("shell", "su", "-c", "ls -la /data/local/tmp/frida-server")
+    if result:
+        print(f"{C}[*] {result.stdout.strip()}{RESET}")
+
+    # إعداد SELinux (مهم لـ Genymotion Cloud)
+    print(f"{C}[*] جاري تعطيل SELinux مؤقتاً (مطلوب لـ Frida)...{RESET}")
+    adb_cmd("shell", "su", "-c", "setenforce 0 2>/dev/null")
 
     # تشغيل Frida Server
     print(f"{C}[*] جاري تشغيل Frida Server...{RESET}")
@@ -525,18 +577,62 @@ def step_5_install_frida_server():
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
     )
-    time.sleep(3)
+    time.sleep(4)
 
-    # التحقق
-    result = adb_cmd("shell", "su", "-c", "ps | grep frida-server")
-    if result and "frida-server" in result.stdout:
-        print(f"{G}[+] Frida Server شغال!{RESET}")
-        return True
-    else:
-        serial_flag = f"-s {DEVICE_SERIAL} " if DEVICE_SERIAL else ""
-        print(f"{Y}[!] ما قدرت أتحقق — جرب يدوياً:{RESET}")
-        print(f"{C}    adb {serial_flag}shell su -c '/data/local/tmp/frida-server &'{RESET}")
-        return True  # نكمل على أمل إنه شغال
+    # التحقق — محاولات متعددة
+    for attempt in range(3):
+        result = adb_cmd("shell", "su", "-c", "ps | grep frida-server")
+        if result and "frida-server" in result.stdout:
+            print(f"{G}[+] Frida Server شغال!{RESET}")
+
+            # اختبار اتصال Frida
+            print(f"{C}[*] جاري اختبار اتصال Frida...{RESET}")
+            frida_test_cmd = ["frida-ps"]
+            if DEVICE_SERIAL:
+                frida_test_cmd.extend(["-D", DEVICE_SERIAL])
+            else:
+                frida_test_cmd.append("-U")
+            test_result = run_cmd(frida_test_cmd, timeout=10)
+            if test_result and test_result.returncode == 0:
+                print(f"{G}[+] Frida متصل بالجهاز بنجاح!{RESET}")
+                return True
+            else:
+                print(f"{Y}[!] Frida Server شغال لكن الاتصال فشل{RESET}")
+                if test_result:
+                    print(f"{R}    {test_result.stderr}{RESET}")
+                # ننتظر ونجرب مرة ثانية
+                time.sleep(2)
+                continue
+
+        if attempt < 2:
+            print(f"{Y}[!] محاولة {attempt + 1}/3 — ننتظر...{RESET}")
+            time.sleep(3)
+
+    # فشل — نعطي تعليمات يدوية
+    serial_flag = f"-s {DEVICE_SERIAL} " if DEVICE_SERIAL else ""
+    print(f"{R}[-] Frida Server لم يشتغل!{RESET}")
+    print(f"{Y}    جرب يدوياً:{RESET}")
+    print(f"{C}    1. adb {serial_flag}shell su -c 'setenforce 0'{RESET}")
+    print(f"{C}    2. adb {serial_flag}shell su -c '/data/local/tmp/frida-server -D &'{RESET}")
+    print(f"{C}    3. frida-ps {'-D ' + DEVICE_SERIAL if DEVICE_SERIAL else '-U'}{RESET}")
+    print(f"{Y}    إذا الأمر الثالث طبع قائمة عمليات، يعني شغال{RESET}")
+
+    retry = input(f"{Y}هل شغّلته يدوياً وتريد الاستمرار؟ (y/n): {RESET}").strip().lower()
+    if retry == 'y':
+        # تحقق أخير
+        frida_test_cmd = ["frida-ps"]
+        if DEVICE_SERIAL:
+            frida_test_cmd.extend(["-D", DEVICE_SERIAL])
+        else:
+            frida_test_cmd.append("-U")
+        test_result = run_cmd(frida_test_cmd, timeout=10)
+        if test_result and test_result.returncode == 0:
+            print(f"{G}[+] Frida متصل بنجاح!{RESET}")
+            return True
+        else:
+            print(f"{R}[-] مازال غير متصل{RESET}")
+            return False
+    return False
 
 
 def step_6_extract_token():
@@ -693,7 +789,11 @@ def main():
     step_4_install_app()
 
     # الخطوة 5: تنصيب Frida
-    step_5_install_frida_server()
+    if not step_5_install_frida_server():
+        print(f"\n{R}[-] فشل تنصيب/تشغيل Frida Server — ما نقدر نكمل{RESET}")
+        print(f"{Y}    لازم Frida Server يكون شغال على الجهاز عشان نسحب التوكن{RESET}")
+        step_7_cleanup(instance_name)
+        return
 
     # الخطوة 6: سحب التوكن
     step_6_extract_token()
