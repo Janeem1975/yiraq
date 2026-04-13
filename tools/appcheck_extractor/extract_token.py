@@ -20,6 +20,8 @@ import sys
 import os
 import time
 import json
+import tempfile
+import shutil
 from pathlib import Path
 
 PACKAGE_NAME = "com.moi.ayniq"
@@ -178,7 +180,7 @@ def method_mitmproxy():
     print(f"{C}   - روح على الإعدادات -> WiFi -> عدّل الشبكة{RESET}")
     print(f"{C}   - فعّل البروكسي اليدوي{RESET}")
     print(f"{C}   - Host: {local_ip}{RESET}")
-    print(f"{C}   - Port: 8080{RESET}")
+    print(f"{C}   - Port: 8080 (أو البورت اللي يطلع بالشاشة){RESET}")
     print(f"{C}3. بالمحاكي، افتح المتصفح وروح على: http://mitm.it{RESET}")
     print(f"{C}   - نزّل شهادة Android واقبلها{RESET}")
     print(f"{C}4. افتح تطبيق عين العراق وسوي أي عملية{RESET}")
@@ -192,14 +194,59 @@ def method_mitmproxy():
     if install_cert == 'y':
         install_system_cert()
 
+    # تحديد بورت متاح
+    port = 8080
+    for try_port in [8080, 8082, 8888, 9090]:
+        try:
+            import socket
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(1)
+            result = sock.connect_ex(('127.0.0.1', try_port))
+            sock.close()
+            if result != 0:  # البورت متاح
+                port = try_port
+                break
+        except Exception:
+            port = try_port
+            break
+
+    if port != 8080:
+        print(f"{Y}[!] البورت 8080 مشغول، سيتم استخدام البورت {port}{RESET}")
+        print(f"{Y}    عدّل إعدادات البروكسي بالمحاكي: Port = {port}{RESET}")
+
     try:
-        subprocess.run(["mitmdump", "-s", addon_file], check=True)
+        subprocess.run(["mitmdump", "-s", addon_file, "--mode", f"regular@{port}"], check=True)
     except KeyboardInterrupt:
         print(f"\n{Y}[*] تم إيقاف mitmproxy{RESET}")
     except FileNotFoundError:
         print(f"{R}[-] mitmdump غير موجود! تأكد من تنصيب mitmproxy{RESET}")
+    except subprocess.CalledProcessError:
+        print(f"{R}[-] فشل تشغيل mitmproxy{RESET}")
+        print(f"{Y}    جرب تشغيله يدوياً: mitmdump -s \"{addon_file}\" --mode regular@{port}{RESET}")
 
     return True
+
+
+def find_openssl():
+    """البحث عن openssl على النظام (يدعم Windows و Linux/macOS)"""
+    # أولاً نجرب الموجود بالـ PATH
+    if shutil.which("openssl"):
+        return "openssl"
+
+    # على Windows نبحث بأماكن معروفة
+    if sys.platform == "win32":
+        common_paths = [
+            r"C:\Program Files\Git\usr\bin\openssl.exe",
+            r"C:\Program Files (x86)\Git\usr\bin\openssl.exe",
+            r"C:\Program Files\OpenSSL-Win64\bin\openssl.exe",
+            r"C:\Program Files\OpenSSL-Win32\bin\openssl.exe",
+            r"C:\Windows\System32\openssl.exe",
+        ]
+        for p in common_paths:
+            if os.path.exists(p):
+                return p
+
+    return None
 
 
 def install_system_cert():
@@ -207,36 +254,67 @@ def install_system_cert():
     cert_path = os.path.expanduser("~/.mitmproxy/mitmproxy-ca-cert.pem")
     if not os.path.exists(cert_path):
         print(f"{Y}[!] شغّل mitmproxy مرة أولاً عشان يولّد الشهادة{RESET}")
-        print(f"{Y}    شغّل: mitmdump --quit{RESET}")
+        print(f"{Y}    شغّل: mitmdump --set connection_strategy=lazy -q{RESET}")
+        print(f"{Y}    وبعدين أوقفه بـ Ctrl+C{RESET}")
+        return
+
+    openssl_cmd = find_openssl()
+    if not openssl_cmd:
+        print(f"{R}[-] openssl غير موجود!{RESET}")
+        print(f"{Y}    على Windows: نزّل Git for Windows من https://git-scm.com{RESET}")
+        print(f"{Y}    (Git يحتوي على openssl جاهز){RESET}")
+        print(f"{Y}    أو نزّل OpenSSL من: https://slproweb.com/products/Win32OpenSSL.html{RESET}")
+        print(f"")
+        print(f"{C}[*] طريقة بديلة بدون openssl:{RESET}")
+        print(f"{C}    1. ادفع الشهادة مباشرة للمحاكي:{RESET}")
+        print(f"{C}       adb push \"{cert_path}\" /sdcard/mitmproxy-ca-cert.pem{RESET}")
+        print(f"{C}    2. بالمحاكي روح على الإعدادات -> الأمان -> تثبيت من التخزين{RESET}")
+        print(f"{C}    3. اختر الملف mitmproxy-ca-cert.pem{RESET}")
         return
 
     print(f"{C}[*] جاري تنصيب الشهادة كشهادة نظام...{RESET}")
+    print(f"{C}[*] باستخدام openssl: {openssl_cmd}{RESET}")
+
+    tmp_dir = tempfile.gettempdir()
     try:
         # حساب هاش الشهادة
         result = subprocess.run(
-            ["openssl", "x509", "-inform", "PEM", "-subject_hash_old", "-in", cert_path, "-noout"],
+            [openssl_cmd, "x509", "-inform", "PEM", "-subject_hash_old", "-in", cert_path, "-noout"],
             capture_output=True, text=True
         )
+        if result.returncode != 0:
+            raise Exception(f"openssl hash failed: {result.stderr}")
+
         cert_hash = result.stdout.strip()
         cert_name = f"{cert_hash}.0"
+        tmp_cert = os.path.join(tmp_dir, cert_name)
 
         # تحويل الشهادة
         subprocess.run([
-            "openssl", "x509", "-inform", "PEM",
+            openssl_cmd, "x509", "-inform", "PEM",
             "-in", cert_path,
-            "-out", f"/tmp/{cert_name}",
+            "-out", tmp_cert,
             "-outform", "DER"
         ], check=True)
 
         # دفعها للجهاز
-        subprocess.run(["adb", "push", f"/tmp/{cert_name}", f"/sdcard/{cert_name}"], check=True)
+        subprocess.run(["adb", "push", tmp_cert, f"/sdcard/{cert_name}"], check=True)
         subprocess.run(["adb", "shell", "su", "-c",
                         f"mount -o remount,rw /system && "
                         f"cp /sdcard/{cert_name} /system/etc/security/cacerts/{cert_name} && "
                         f"chmod 644 /system/etc/security/cacerts/{cert_name} && "
                         f"mount -o remount,ro /system"], check=True)
 
+        # حذف الملف المؤقت
+        try:
+            os.remove(tmp_cert)
+        except OSError:
+            pass
+
         print(f"{G}[+] تم تنصيب الشهادة! أعد تشغيل المحاكي{RESET}")
+    except subprocess.CalledProcessError as e:
+        print(f"{R}[-] فشل تنصيب الشهادة (أمر فشل): {e}{RESET}")
+        print(f"{Y}    تأكد من تفعيل الروت بالمحاكي{RESET}")
     except Exception as e:
         print(f"{R}[-] فشل تنصيب الشهادة: {e}{RESET}")
 
