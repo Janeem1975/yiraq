@@ -112,28 +112,65 @@ def _test_adb_alive(retries=3):
 
 
 def _detect_root_shell():
-    """كشف إذا الـ shell أصلاً root (بدون حاجة لـ su)"""
-    global SHELL_IS_ROOT
+    """كشف إذا الـ shell أصلاً root وتصعيد الصلاحيات إذا لزم"""
+    global SHELL_IS_ROOT, DEVICE_SERIAL
+
+    # فحص 1: هل الـ shell أصلاً root
     result = adb_cmd("shell", "id", timeout=10)
     if result and result.returncode == 0 and "uid=0" in result.stdout:
         SHELL_IS_ROOT = True
         print(f"{G}[+] Shell أصلاً root — ما نحتاج su{RESET}")
         return True
-    # جرب su
+
+    # فحص 2: تصعيد بـ adb root (يعيد تشغيل adbd كـ root)
+    print(f"{C}[*] جاري تصعيد الصلاحيات بـ adb root...{RESET}")
+    root_result = adb_cmd("root", timeout=15)
+    if root_result:
+        print(f"{C}    adb root: {root_result.stdout.strip()} {root_result.stderr.strip()}{RESET}")
+    time.sleep(3)  # انتظر adbd يعيد تشغيل
+
+    # إعادة اتصال ADB بعد adb root (ضروري للأجهزة السحابية)
+    if DEVICE_SERIAL and "localhost:" in DEVICE_SERIAL and INSTANCE_NAME:
+        print(f"{C}[*] إعادة اتصال ADB بعد التصعيد...{RESET}")
+        reconn = run_cmd(["gmsaas", "instances", "adbconnect", INSTANCE_NAME], timeout=30)
+        if reconn and reconn.returncode == 0:
+            # تحديث السريال إذا تغيّر
+            out = reconn.stdout.strip()
+            for line in out.split('\n'):
+                if 'localhost:' in line:
+                    new_serial = line.strip().split()[0] if line.strip() else None
+                    if new_serial and 'localhost:' in new_serial:
+                        DEVICE_SERIAL = new_serial
+            print(f"{G}[+] تم إعادة الاتصال: {DEVICE_SERIAL}{RESET}")
+        time.sleep(2)
+
+    # فحص ثاني بعد adb root
+    result = adb_cmd("shell", "id", timeout=10)
+    if result and result.returncode == 0 and "uid=0" in result.stdout:
+        SHELL_IS_ROOT = True
+        print(f"{G}[+] adb root نجح! Shell الآن root{RESET}")
+        return True
+
+    # فحص 3: su -c
     result = adb_cmd("shell", "su -c 'id'", timeout=10)
     if result and result.returncode == 0 and "uid=0" in result.stdout:
         SHELL_IS_ROOT = False
         print(f"{G}[+] su شغال — نستخدمه للأوامر{RESET}")
         return True
-    # جرب su 0
+
+    # فحص 4: su 0
     result = adb_cmd("shell", "su 0 id", timeout=10)
     if result and result.returncode == 0 and "uid=0" in result.stdout:
-        SHELL_IS_ROOT = False  # su 0 variant
+        SHELL_IS_ROOT = False
         print(f"{G}[+] su 0 شغال{RESET}")
         return True
+
+    # ما لقينا root بأي طريقة
     SHELL_IS_ROOT = True  # نفترض root لأن su ما اشتغل
-    print(f"{Y}[!] su ما اشتغل — نفترض الـ shell root{RESET}")
-    return True
+    print(f"{R}[!] تحذير: ما قدرنا نحصل على root!{RESET}")
+    print(f"{Y}    adb root و su كلهم فشلو. Frida بيشتغل بصلاحيات محدودة.{RESET}")
+    print(f"{Y}    جرب يدوياً: adb -s {DEVICE_SERIAL} root{RESET}")
+    return False
 
 
 def adb_su(command, timeout=30):
@@ -155,6 +192,24 @@ def _start_frida_server():
         _detect_root_shell()
 
     print(f"{C}[*] جاري تشغيل frida-server...{RESET}")
+
+    # فحص هل frida-server يشتغل كـ root
+    fs_check = adb_cmd("shell", "ps -eo pid,user,args 2>/dev/null | grep frida-server | grep -v grep", timeout=5)
+    if fs_check and fs_check.stdout.strip():
+        print(f"{C}[*] حالة frida-server: {fs_check.stdout.strip()}{RESET}")
+        if "root" in fs_check.stdout:
+            # frida-server شغال كـ root — نتحقق بـ frida-ps
+            frida_check = ["frida-ps"]
+            if DEVICE_SERIAL:
+                frida_check.extend(["-D", DEVICE_SERIAL])
+            else:
+                frida_check.append("-U")
+            check = run_cmd(frida_check, timeout=10)
+            if check and check.returncode == 0 and "PID" in check.stdout:
+                print(f"{G}[+] Frida Server أصلاً شغال كـ root!{RESET}")
+                return True
+        # شغال بس مش كـ root — نوقفه ونعيد
+        print(f"{Y}[!] frida-server شغال بس مش كـ root — نعيد تشغيله{RESET}")
 
     # إيقاف أي نسخة قديمة أولاً (بكل الطرق الممكنة)
     for kill_cmd in ["pkill -9 -f frida-server", "killall frida-server"]:
@@ -194,7 +249,7 @@ def _start_frida_server():
         subprocess.Popen(adb_popen_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(3)
 
-        # فحص سريع
+        # فحص سريع — frida-ps + التحقق من صلاحيات العملية
         frida_check = ["frida-ps"]
         if DEVICE_SERIAL:
             frida_check.extend(["-D", DEVICE_SERIAL])
@@ -202,9 +257,21 @@ def _start_frida_server():
             frida_check.append("-U")
         check = run_cmd(frida_check, timeout=10)
         if check and check.returncode == 0 and "PID" in check.stdout:
-            print(f"{G}[+] Frida Server شغال ومتصل!{RESET}")
-            started = True
-            break
+            # تحقق إضافي: هل يشتغل كـ root
+            uid_check = adb_cmd("shell", "ps -eo pid,user,args 2>/dev/null | grep frida-server | grep -v grep", timeout=5)
+            if uid_check and uid_check.stdout.strip():
+                print(f"{C}    عملية frida-server: {uid_check.stdout.strip()}{RESET}")
+                if "root" in uid_check.stdout:
+                    print(f"{G}[+] Frida Server شغال كـ root!{RESET}")
+                    started = True
+                    break
+                else:
+                    print(f"{Y}[!] frida-server شغال بس مش كـ root — نجرب طريقة ثانية{RESET}")
+            else:
+                # ما قدرنا نتحقق من الصلاحيات — نقبل
+                print(f"{G}[+] Frida Server شغال ومتصل!{RESET}")
+                started = True
+                break
         # إذا ما اشتغل، نوقفه ونجرب الطريقة التالية
         for kill_cmd in ["pkill -9 -f frida-server", "killall frida-server"]:
             adb_su(kill_cmd + " 2>/dev/null")
@@ -1360,9 +1427,9 @@ def step_6_extract_token():
         time.sleep(2)
 
         if DEVICE_SERIAL:
-            frida_cmd = ["frida", "-D", DEVICE_SERIAL, "-n", PACKAGE_NAME, "-l", script_to_use, "--no-pause"]
+            frida_cmd = ["frida", "-D", DEVICE_SERIAL, "-n", PACKAGE_NAME, "-l", script_to_use]
         else:
-            frida_cmd = ["frida", "-U", "-n", PACKAGE_NAME, "-l", script_to_use, "--no-pause"]
+            frida_cmd = ["frida", "-U", "-n", PACKAGE_NAME, "-l", script_to_use]
 
         print(f"{C}[*] Frida CLI attach mode...{RESET}")
         print(f"{Y}[*] اضغط Ctrl+C لإيقاف المراقبة{RESET}\n")
