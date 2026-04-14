@@ -57,6 +57,7 @@ def print_banner():
 # متغيرات عامة
 DEVICE_SERIAL = None
 INSTANCE_NAME = None  # UUID الجهاز السحابي لإعادة الاتصال
+SHELL_IS_ROOT = None  # هل الـ shell أصلاً root (بدون su)
 
 
 def run_cmd(cmd, capture=True, timeout=30):
@@ -110,46 +111,122 @@ def _test_adb_alive(retries=3):
     return False
 
 
+def _detect_root_shell():
+    """كشف إذا الـ shell أصلاً root (بدون حاجة لـ su)"""
+    global SHELL_IS_ROOT
+    result = adb_cmd("shell", "id", timeout=10)
+    if result and result.returncode == 0 and "uid=0" in result.stdout:
+        SHELL_IS_ROOT = True
+        print(f"{G}[+] Shell أصلاً root — ما نحتاج su{RESET}")
+        return True
+    # جرب su
+    result = adb_cmd("shell", "su -c 'id'", timeout=10)
+    if result and result.returncode == 0 and "uid=0" in result.stdout:
+        SHELL_IS_ROOT = False
+        print(f"{G}[+] su شغال — نستخدمه للأوامر{RESET}")
+        return True
+    # جرب su 0
+    result = adb_cmd("shell", "su 0 id", timeout=10)
+    if result and result.returncode == 0 and "uid=0" in result.stdout:
+        SHELL_IS_ROOT = False  # su 0 variant
+        print(f"{G}[+] su 0 شغال{RESET}")
+        return True
+    SHELL_IS_ROOT = True  # نفترض root لأن su ما اشتغل
+    print(f"{Y}[!] su ما اشتغل — نفترض الـ shell root{RESET}")
+    return True
+
+
 def adb_su(command, timeout=30):
-    """تشغيل أمر root على الجهاز — يمرر الأمر كسلسلة واحدة لـ su -c"""
-    # نجمع كل شي بأمر واحد عشان su -c يأخذه صح
-    return adb_cmd("shell", f"su -c '{command}'", timeout=timeout)
+    """تشغيل أمر root على الجهاز — يكتشف تلقائياً إذا يحتاج su أو لا"""
+    global SHELL_IS_ROOT
+    if SHELL_IS_ROOT is None:
+        _detect_root_shell()
+    if SHELL_IS_ROOT:
+        # الـ shell أصلاً root — نشغل الأمر مباشرة
+        return adb_cmd("shell", command, timeout=timeout)
+    else:
+        return adb_cmd("shell", f"su -c '{command}'", timeout=timeout)
 
 
 def _start_frida_server():
     """تشغيل frida-server الموجود على الجهاز والتحقق من اتصال Frida"""
+    global SHELL_IS_ROOT
+    if SHELL_IS_ROOT is None:
+        _detect_root_shell()
+
     print(f"{C}[*] جاري تشغيل frida-server...{RESET}")
-    adb_su("chmod 755 /data/local/tmp/frida-server")
-    adb_su("setenforce 0 2>/dev/null")
-    adb_su("pkill -f frida-server 2>/dev/null")
+
+    # إيقاف أي نسخة قديمة أولاً (بكل الطرق الممكنة)
+    for kill_cmd in ["pkill -9 -f frida-server", "killall frida-server"]:
+        adb_su(kill_cmd + " 2>/dev/null")
     time.sleep(1)
 
-    # تشغيل frida-server بالخلفية
-    adb_popen_cmd = ["adb"]
-    if DEVICE_SERIAL:
-        adb_popen_cmd.extend(["-s", DEVICE_SERIAL])
-    adb_popen_cmd.extend(["shell", "su -c '/data/local/tmp/frida-server -D &'"])
-    subprocess.Popen(adb_popen_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    print(f"{C}[*] ننتظر Frida Server يبدأ...{RESET}")
-    time.sleep(4)
+    # تعيين الصلاحيات وتعطيل SELinux
+    adb_su("chmod 755 /data/local/tmp/frida-server")
+    adb_su("setenforce 0 2>/dev/null")
 
-    # فحص الاتصال — محاولات متعددة
+    # تشغيل frida-server بعدة طرق حسب نوع الـ root
+    started = False
+    start_methods = []
+
+    if SHELL_IS_ROOT:
+        # الـ shell أصلاً root
+        start_methods = [
+            ["shell", "/data/local/tmp/frida-server -D"],
+            ["shell", "nohup /data/local/tmp/frida-server -D &"],
+            ["shell", "/data/local/tmp/frida-server -l 0.0.0.0:27042 -D"],
+        ]
+    else:
+        # نحتاج su
+        start_methods = [
+            ["shell", "su -c '/data/local/tmp/frida-server -D'"],
+            ["shell", "su -c 'nohup /data/local/tmp/frida-server -D &'"],
+            ["shell", "su -c '/data/local/tmp/frida-server -l 0.0.0.0:27042 -D'"],
+            ["shell", "su 0 /data/local/tmp/frida-server -D"],
+        ]
+
+    for method_args in start_methods:
+        adb_popen_cmd = ["adb"]
+        if DEVICE_SERIAL:
+            adb_popen_cmd.extend(["-s", DEVICE_SERIAL])
+        adb_popen_cmd.extend(method_args)
+        print(f"{C}[*] طريقة التشغيل: {' '.join(method_args)}{RESET}")
+        subprocess.Popen(adb_popen_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(3)
+
+        # فحص سريع
+        frida_check = ["frida-ps"]
+        if DEVICE_SERIAL:
+            frida_check.extend(["-D", DEVICE_SERIAL])
+        else:
+            frida_check.append("-U")
+        check = run_cmd(frida_check, timeout=10)
+        if check and check.returncode == 0 and "PID" in check.stdout:
+            print(f"{G}[+] Frida Server شغال ومتصل!{RESET}")
+            started = True
+            break
+        # إذا ما اشتغل، نوقفه ونجرب الطريقة التالية
+        for kill_cmd in ["pkill -9 -f frida-server", "killall frida-server"]:
+            adb_su(kill_cmd + " 2>/dev/null")
+        time.sleep(1)
+
+    if started:
+        return True
+
+    # محاولة أخيرة — ننتظر أكثر
+    print(f"{Y}[!] ننتظر أكثر لـ Frida Server...{RESET}")
+    time.sleep(5)
     frida_check = ["frida-ps"]
     if DEVICE_SERIAL:
         frida_check.extend(["-D", DEVICE_SERIAL])
     else:
         frida_check.append("-U")
+    check = run_cmd(frida_check, timeout=15)
+    if check and check.returncode == 0 and "PID" in check.stdout:
+        print(f"{G}[+] Frida Server شغال ومتصل!{RESET}")
+        return True
 
-    for attempt in range(5):
-        check = run_cmd(frida_check, timeout=15)
-        if check and check.returncode == 0 and "PID" in check.stdout:
-            print(f"{G}[+] Frida Server شغال ومتصل!{RESET}")
-            return True
-        if attempt < 4:
-            print(f"{Y}[!] محاولة {attempt + 1}/5 — ننتظر...{RESET}")
-            time.sleep(3)
-
-    print(f"{R}[-] Frida Server لم يستجب بعد 5 محاولات{RESET}")
+    print(f"{R}[-] Frida Server لم يشتغل بأي طريقة{RESET}")
     return False
 
 
@@ -485,6 +562,9 @@ def step_3_connect_adb(instance_name):
             DEVICE_SERIAL = serial_input
         else:
             print(f"{Y}[!] سيتم استخدام ADB بدون تحديد جهاز — قد يستهدف جهاز خطأ{RESET}")
+
+    # كشف مبكر هل الـ shell root أو يحتاج su
+    _detect_root_shell()
 
     return True
 
@@ -1023,6 +1103,219 @@ def step_5_install_frida_server():
     return True
 
 
+def _find_launcher_activity():
+    """اكتشاف الـ activity الرئيسي للتطبيق"""
+    # الطريقة 1: dumpsys
+    result = adb_cmd("shell", f"dumpsys package {PACKAGE_NAME} | grep -A1 'android.intent.action.MAIN'", timeout=10)
+    if result and result.stdout:
+        for line in result.stdout.split('\n'):
+            line = line.strip()
+            if PACKAGE_NAME in line and '/' in line:
+                # استخراج activity name
+                parts = line.split()
+                for part in parts:
+                    if '/' in part and PACKAGE_NAME in part:
+                        return part.strip()
+    # الطريقة 2: cmd package
+    result = adb_cmd("shell", f"cmd package resolve-activity --brief {PACKAGE_NAME}", timeout=10)
+    if result and result.stdout:
+        for line in result.stdout.strip().split('\n'):
+            if '/' in line and PACKAGE_NAME in line:
+                return line.strip()
+    return None
+
+
+def _launch_app():
+    """فتح التطبيق بكل الطرق الممكنة والتأكد إنه شغال"""
+    print(f"{C}[*] جاري فتح التطبيق...{RESET}")
+
+    # اكتشاف الـ activity الرئيسي
+    launcher = _find_launcher_activity()
+    if launcher:
+        print(f"{C}[*] Activity الرئيسي: {launcher}{RESET}")
+        adb_cmd("shell", f"am start -n {launcher}", timeout=10)
+    else:
+        # طرق بديلة
+        adb_cmd("shell", f"am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER {PACKAGE_NAME}", timeout=10)
+        adb_cmd("shell", f"monkey -p {PACKAGE_NAME} -c android.intent.category.LAUNCHER 1", timeout=10)
+
+    time.sleep(3)
+
+    # تحقق هل التطبيق شغال
+    result = adb_cmd("shell", f"pidof {PACKAGE_NAME}", timeout=5)
+    if result and result.stdout.strip().isdigit():
+        print(f"{G}[+] التطبيق شغال (PID: {result.stdout.strip()}){RESET}")
+        return True
+
+    # طريقة بديلة للفحص
+    result = adb_cmd("shell", f"ps | grep {PACKAGE_NAME}", timeout=5)
+    if result and PACKAGE_NAME in result.stdout:
+        print(f"{G}[+] التطبيق شغال!{RESET}")
+        return True
+
+    print(f"{Y}[!] التطبيق ممكن ما فتح أو عمل crash{RESET}")
+    return False
+
+
+def _frida_spawn_python(script_path):
+    """استخدام Python frida API لـ spawn — أقوى من CLI"""
+    try:
+        import frida
+    except ImportError:
+        print(f"{Y}[!] frida module مش منصب — بنستخدم CLI{RESET}")
+        return None
+
+    device = None
+    script_code = open(script_path, 'r', encoding='utf-8').read()
+
+    # === الطريقة 1: Port forwarding + remote device ===
+    if DEVICE_SERIAL and "localhost:" in DEVICE_SERIAL:
+        print(f"{C}[*] إعداد port forwarding لـ Frida Python API...{RESET}")
+        fwd_result = adb_cmd("forward", "tcp:27042", "tcp:27042", timeout=10)
+        if fwd_result and fwd_result.returncode == 0:
+            try:
+                mgr = frida.get_device_manager()
+                device = mgr.add_remote_device("127.0.0.1:27042")
+                # تحقق سريع
+                device.enumerate_processes()
+                print(f"{G}[+] متصل عبر TCP (127.0.0.1:27042){RESET}")
+            except Exception as e:
+                print(f"{Y}[!] TCP فشل: {e}{RESET}")
+                device = None
+
+    # === الطريقة 2: -D device by serial ===
+    if not device and DEVICE_SERIAL:
+        try:
+            device = frida.get_device(DEVICE_SERIAL, timeout=10)
+            device.enumerate_processes()
+            print(f"{G}[+] متصل بـ {DEVICE_SERIAL}{RESET}")
+        except Exception as e:
+            print(f"{Y}[!] -D فشل: {e}{RESET}")
+            device = None
+
+    # === الطريقة 3: USB ===
+    if not device:
+        try:
+            device = frida.get_usb_device(timeout=10)
+            device.enumerate_processes()
+            print(f"{G}[+] متصل عبر USB{RESET}")
+        except Exception as e:
+            print(f"{Y}[!] USB فشل: {e}{RESET}")
+            return None
+
+    if not device:
+        return None
+
+    # === محاولة spawn ===
+    token_found = [False]
+    token_value = [None]
+
+    def on_message(message, data):
+        if message['type'] == 'send':
+            payload = str(message.get('payload', ''))
+            print(f"{C}{payload}{RESET}")
+            if 'APP CHECK TOKEN' in payload or 'eyJ' in payload:
+                token_found[0] = True
+                # استخراج التوكن
+                for part in payload.split():
+                    if part.startswith('eyJ'):
+                        token_value[0] = part
+        elif message['type'] == 'error':
+            print(f"{R}[Frida Error] {message.get('description', '')}{RESET}")
+
+    # محاولة 1: spawn
+    print(f"{C}[*] Python Frida API — spawn mode...{RESET}")
+    try:
+        pid = device.spawn([PACKAGE_NAME])
+        print(f"{G}[+] Spawn نجح! PID: {pid}{RESET}")
+        session = device.attach(pid)
+        script = session.create_script(script_code)
+        script.on('message', on_message)
+        script.load()
+        device.resume(pid)
+        print(f"{G}[+] التطبيق شغال مع التجاوز! اضغط Ctrl+C لما يظهر التوكن{RESET}")
+
+        try:
+            while True:
+                time.sleep(1)
+                if token_found[0]:
+                    print(f"\n{G}[+] تم رصد التوكن عبر Python API!{RESET}")
+                    break
+        except KeyboardInterrupt:
+            print(f"\n{Y}[*] تم إيقاف المراقبة{RESET}")
+
+        try:
+            script.unload()
+            session.detach()
+        except Exception:
+            pass
+        return token_found[0]
+
+    except frida.NotSupportedError as e:
+        print(f"{Y}[!] Spawn غير مدعوم: {e}{RESET}")
+    except Exception as e:
+        print(f"{Y}[!] Spawn فشل: {e}{RESET}")
+
+    # محاولة 2: attach (نفتح التطبيق أولاً)
+    print(f"\n{C}[*] Python Frida API — attach mode...{RESET}")
+    _launch_app()
+    time.sleep(2)
+
+    try:
+        # نلاقي الـ PID
+        target_pid = None
+        for proc in device.enumerate_processes():
+            if proc.name == PACKAGE_NAME or PACKAGE_NAME in proc.name:
+                target_pid = proc.pid
+                break
+
+        if not target_pid:
+            # جرب بالاسم المختصر
+            result = adb_cmd("shell", f"pidof {PACKAGE_NAME}", timeout=5)
+            if result and result.stdout.strip().isdigit():
+                target_pid = int(result.stdout.strip())
+
+        if not target_pid:
+            print(f"{R}[-] التطبيق مش شغال — ممكن عمل crash بسبب كشف الروت{RESET}")
+            # نعرض logcat لتشخيص المشكلة
+            print(f"{C}[*] جاري فحص سجل الأخطاء...{RESET}")
+            log = adb_cmd("shell", f"logcat -d -t 30 --pid=$(pidof {PACKAGE_NAME}) 2>/dev/null || logcat -d -t 50 | grep -i '{PACKAGE_NAME}\\|root\\|detect\\|security'", timeout=10)
+            if log and log.stdout.strip():
+                print(f"{Y}--- سجل الأخطاء ---{RESET}")
+                for line in log.stdout.strip().split('\n')[-20:]:
+                    print(f"  {line}")
+                print(f"{Y}--- نهاية السجل ---{RESET}")
+            return None
+
+        print(f"{G}[+] التطبيق شغال — PID: {target_pid}{RESET}")
+        session = device.attach(target_pid)
+        script = session.create_script(script_code)
+        script.on('message', on_message)
+        script.load()
+        print(f"{G}[+] سكربت التجاوز محمّل! سوي عملية بالتطبيق{RESET}")
+        print(f"{Y}[*] اضغط Ctrl+C لإيقاف المراقبة{RESET}")
+
+        try:
+            while True:
+                time.sleep(1)
+                if token_found[0]:
+                    print(f"\n{G}[+] تم رصد التوكن!{RESET}")
+                    break
+        except KeyboardInterrupt:
+            print(f"\n{Y}[*] تم إيقاف المراقبة{RESET}")
+
+        try:
+            script.unload()
+            session.detach()
+        except Exception:
+            pass
+        return token_found[0]
+
+    except Exception as e:
+        print(f"{R}[-] Attach فشل: {e}{RESET}")
+        return None
+
+
 def step_6_extract_token():
     """الخطوة 6: سحب التوكن"""
     print(f"\n{B}{'=' * 55}{RESET}")
@@ -1038,8 +1331,8 @@ def step_6_extract_token():
         return False
 
     if use_bypass:
-        print(f"{G}[+] سيتم استخدام سكربت تجاوز كشف المحاكي تلقائياً{RESET}")
-        print(f"{C}[*] هذا يمنع التطبيق من كشف الجهاز السحابي كمحاكي{RESET}")
+        print(f"{G}[+] سيتم استخدام سكربت تجاوز كشف المحاكي والروت تلقائياً{RESET}")
+        print(f"{C}[*] هذا يمنع التطبيق من كشف الجهاز السحابي كمحاكي أو مروّت{RESET}")
     else:
         print(f"{Y}[!] سكربت تجاوز المحاكي غير موجود — سيتم استخدام السكربت العادي{RESET}")
 
@@ -1048,90 +1341,31 @@ def step_6_extract_token():
 
     # إيقاف التطبيق أولاً لضمان تحميل التجاوز من البداية
     print(f"{C}[*] جاري إيقاف التطبيق (إذا شغال)...{RESET}")
-    adb_cmd("shell", "am", "force-stop", PACKAGE_NAME)
+    adb_cmd("shell", f"am force-stop {PACKAGE_NAME}")
     time.sleep(1)
 
-    print(f"{C}[*] جاري تشغيل التطبيق مع Frida...{RESET}")
-
-    # === إعداد port forwarding لـ Frida (يتجاوز مشكلة spawn عبر ADB tunnel) ===
-    frida_cmd = None
-    use_host_mode = False
-
-    if DEVICE_SERIAL and "localhost:" in DEVICE_SERIAL:
-        # جهاز سحابي عبر gmsaas tunnel — نحتاج port forwarding لـ spawn
-        print(f"{C}[*] إعداد port forwarding لـ Frida (spawn mode)...{RESET}")
-        fwd_result = adb_cmd("forward", "tcp:27042", "tcp:27042", timeout=10)
-        if fwd_result and fwd_result.returncode == 0:
-            # نتحقق إن الاتصال يشتغل عبر -H
-            test_h = run_cmd(["frida-ps", "-H", "127.0.0.1:27042"], timeout=10)
-            if test_h and test_h.returncode == 0 and "PID" in test_h.stdout:
-                print(f"{G}[+] Port forwarding شغال — نستخدم Host mode{RESET}")
-                frida_cmd = ["frida", "-H", "127.0.0.1:27042", "-f", PACKAGE_NAME, "-l", script_to_use]
-                use_host_mode = True
-            else:
-                print(f"{Y}[!] Port forwarding ما اشتغل — بنجرب -D{RESET}")
-
-    if not frida_cmd:
-        if DEVICE_SERIAL:
-            frida_cmd = ["frida", "-D", DEVICE_SERIAL, "-f", PACKAGE_NAME, "-l", script_to_use]
-            print(f"{C}[*] Frida يستهدف الجهاز: {DEVICE_SERIAL}{RESET}")
-        else:
-            frida_cmd = ["frida", "-U", "-f", PACKAGE_NAME, "-l", script_to_use]
-
-    print(f"{C}[*] سوي أي عملية بالتطبيق عشان يرسل طلب ويظهر التوكن{RESET}")
-    print(f"{Y}[*] اضغط Ctrl+C لإيقاف المراقبة وسحب التوكن{RESET}\n")
+    # === الأولوية 1: Python Frida API (أقوى وأضمن) ===
+    print(f"\n{C}[*] === محاولة Python Frida API ==={RESET}")
+    result = _frida_spawn_python(script_to_use)
 
     token_found = False
-    spawn_failed = False
-    try:
-        process = subprocess.Popen(
-            frida_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True
-        )
+    if result is True:
+        token_found = True
+    elif result is None:
+        # Python API فشل — نجرب CLI كـ fallback
+        print(f"\n{C}[*] === محاولة Frida CLI ==={RESET}")
 
-        for line in process.stdout:
-            print(line, end="")
-            if "APP CHECK TOKEN" in line or "eyJ" in line:
-                token_found = True
-                print(f"\n{G}[+] تم رصد التوكن!{RESET}")
-            if "need Gadget" in line or "Failed to spawn" in line:
-                spawn_failed = True
-                break
+        # Fallback: CLI مع attach mode (نفتح التطبيق أولاً)
+        _launch_app()
+        time.sleep(2)
 
-    except KeyboardInterrupt:
-        print(f"\n{Y}[*] تم إيقاف المراقبة{RESET}")
-        try:
-            process.terminate()
-        except Exception:
-            pass
-
-    # === Fallback: إذا spawn فشل، نفتح التطبيق يدوياً ونربط بـ attach mode ===
-    if spawn_failed and not token_found:
-        print(f"\n{Y}[!] Spawn mode فشل — بنجرب Attach mode...{RESET}")
-        try:
-            process.terminate()
-        except Exception:
-            pass
-
-        # نفتح التطبيق بـ ADB
-        print(f"{C}[*] جاري فتح التطبيق بـ ADB...{RESET}")
-        adb_cmd("shell", "am", "start", "-n", f"{PACKAGE_NAME}/.MainActivity", timeout=10)
-        # إذا ما نعرف الـ activity الرئيسي
-        adb_cmd("shell", "monkey", "-p", PACKAGE_NAME, "-c", "android.intent.category.LAUNCHER", "1", timeout=10)
-        time.sleep(3)
-
-        # نربط بـ attach mode
-        if use_host_mode:
-            frida_cmd = ["frida", "-H", "127.0.0.1:27042", "-n", PACKAGE_NAME, "-l", script_to_use]
-        elif DEVICE_SERIAL:
-            frida_cmd = ["frida", "-D", DEVICE_SERIAL, "-n", PACKAGE_NAME, "-l", script_to_use]
+        if DEVICE_SERIAL:
+            frida_cmd = ["frida", "-D", DEVICE_SERIAL, "-n", PACKAGE_NAME, "-l", script_to_use, "--no-pause"]
         else:
-            frida_cmd = ["frida", "-U", "-n", PACKAGE_NAME, "-l", script_to_use]
+            frida_cmd = ["frida", "-U", "-n", PACKAGE_NAME, "-l", script_to_use, "--no-pause"]
 
-        print(f"{C}[*] Frida attach mode — نربط بالتطبيق الشغال...{RESET}")
-        print(f"{Y}[*] اضغط Ctrl+C لإيقاف المراقبة وسحب التوكن{RESET}\n")
+        print(f"{C}[*] Frida CLI attach mode...{RESET}")
+        print(f"{Y}[*] اضغط Ctrl+C لإيقاف المراقبة{RESET}\n")
 
         try:
             process = subprocess.Popen(
@@ -1189,6 +1423,7 @@ def step_6_extract_token():
         print(f"{Y}    1. التطبيق فتح بشكل طبيعي (بدون crash){RESET}")
         print(f"{Y}    2. سويت عملية تتطلب اتصال بالسيرفر{RESET}")
         print(f"{Y}    3. Frida Server شغال بصلاحيات root{RESET}")
+        print(f"{Y}    4. راجع سجل الأخطاء أعلاه لمعرفة سبب الفشل{RESET}")
 
     return False
 
