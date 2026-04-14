@@ -1052,17 +1052,37 @@ def step_6_extract_token():
     time.sleep(1)
 
     print(f"{C}[*] جاري تشغيل التطبيق مع Frida...{RESET}")
-    # استخدام -D بدل -U لتحديد الجهاز بالسريال
-    if DEVICE_SERIAL:
-        frida_cmd = ["frida", "-D", DEVICE_SERIAL, "-f", PACKAGE_NAME, "-l", script_to_use]
-        print(f"{C}[*] Frida يستهدف الجهاز: {DEVICE_SERIAL}{RESET}")
-    else:
-        frida_cmd = ["frida", "-U", "-f", PACKAGE_NAME, "-l", script_to_use]
+
+    # === إعداد port forwarding لـ Frida (يتجاوز مشكلة spawn عبر ADB tunnel) ===
+    frida_cmd = None
+    use_host_mode = False
+
+    if DEVICE_SERIAL and "localhost:" in DEVICE_SERIAL:
+        # جهاز سحابي عبر gmsaas tunnel — نحتاج port forwarding لـ spawn
+        print(f"{C}[*] إعداد port forwarding لـ Frida (spawn mode)...{RESET}")
+        fwd_result = adb_cmd("forward", "tcp:27042", "tcp:27042", timeout=10)
+        if fwd_result and fwd_result.returncode == 0:
+            # نتحقق إن الاتصال يشتغل عبر -H
+            test_h = run_cmd(["frida-ps", "-H", "127.0.0.1:27042"], timeout=10)
+            if test_h and test_h.returncode == 0 and "PID" in test_h.stdout:
+                print(f"{G}[+] Port forwarding شغال — نستخدم Host mode{RESET}")
+                frida_cmd = ["frida", "-H", "127.0.0.1:27042", "-f", PACKAGE_NAME, "-l", script_to_use]
+                use_host_mode = True
+            else:
+                print(f"{Y}[!] Port forwarding ما اشتغل — بنجرب -D{RESET}")
+
+    if not frida_cmd:
+        if DEVICE_SERIAL:
+            frida_cmd = ["frida", "-D", DEVICE_SERIAL, "-f", PACKAGE_NAME, "-l", script_to_use]
+            print(f"{C}[*] Frida يستهدف الجهاز: {DEVICE_SERIAL}{RESET}")
+        else:
+            frida_cmd = ["frida", "-U", "-f", PACKAGE_NAME, "-l", script_to_use]
 
     print(f"{C}[*] سوي أي عملية بالتطبيق عشان يرسل طلب ويظهر التوكن{RESET}")
     print(f"{Y}[*] اضغط Ctrl+C لإيقاف المراقبة وسحب التوكن{RESET}\n")
 
     token_found = False
+    spawn_failed = False
     try:
         process = subprocess.Popen(
             frida_cmd,
@@ -1076,6 +1096,9 @@ def step_6_extract_token():
             if "APP CHECK TOKEN" in line or "eyJ" in line:
                 token_found = True
                 print(f"\n{G}[+] تم رصد التوكن!{RESET}")
+            if "need Gadget" in line or "Failed to spawn" in line:
+                spawn_failed = True
+                break
 
     except KeyboardInterrupt:
         print(f"\n{Y}[*] تم إيقاف المراقبة{RESET}")
@@ -1083,6 +1106,53 @@ def step_6_extract_token():
             process.terminate()
         except Exception:
             pass
+
+    # === Fallback: إذا spawn فشل، نفتح التطبيق يدوياً ونربط بـ attach mode ===
+    if spawn_failed and not token_found:
+        print(f"\n{Y}[!] Spawn mode فشل — بنجرب Attach mode...{RESET}")
+        try:
+            process.terminate()
+        except Exception:
+            pass
+
+        # نفتح التطبيق بـ ADB
+        print(f"{C}[*] جاري فتح التطبيق بـ ADB...{RESET}")
+        adb_cmd("shell", "am", "start", "-n", f"{PACKAGE_NAME}/.MainActivity", timeout=10)
+        # إذا ما نعرف الـ activity الرئيسي
+        adb_cmd("shell", "monkey", "-p", PACKAGE_NAME, "-c", "android.intent.category.LAUNCHER", "1", timeout=10)
+        time.sleep(3)
+
+        # نربط بـ attach mode
+        if use_host_mode:
+            frida_cmd = ["frida", "-H", "127.0.0.1:27042", "-n", PACKAGE_NAME, "-l", script_to_use]
+        elif DEVICE_SERIAL:
+            frida_cmd = ["frida", "-D", DEVICE_SERIAL, "-n", PACKAGE_NAME, "-l", script_to_use]
+        else:
+            frida_cmd = ["frida", "-U", "-n", PACKAGE_NAME, "-l", script_to_use]
+
+        print(f"{C}[*] Frida attach mode — نربط بالتطبيق الشغال...{RESET}")
+        print(f"{Y}[*] اضغط Ctrl+C لإيقاف المراقبة وسحب التوكن{RESET}\n")
+
+        try:
+            process = subprocess.Popen(
+                frida_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+
+            for line in process.stdout:
+                print(line, end="")
+                if "APP CHECK TOKEN" in line or "eyJ" in line:
+                    token_found = True
+                    print(f"\n{G}[+] تم رصد التوكن!{RESET}")
+
+        except KeyboardInterrupt:
+            print(f"\n{Y}[*] تم إيقاف المراقبة{RESET}")
+            try:
+                process.terminate()
+            except Exception:
+                pass
 
     # محاولة سحب الملف
     time.sleep(1)
