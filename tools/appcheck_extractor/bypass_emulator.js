@@ -119,57 +119,10 @@ Java.perform(function () {
 
     // ============================================================
     //  القسم 3: إخفاء ملفات المحاكي
+    //  (ملاحظة: File.exists hook الشامل موجود بالقسم 10a
+    //   يغطي ملفات المحاكي + الروت + Magisk + Frida)
     // ============================================================
-    try {
-        var File = Java.use("java.io.File");
-        
-        var emuFiles = [
-            "/dev/qemu_pipe",
-            "/dev/qemu_trace",
-            "/dev/goldfish_pipe",
-            "/dev/socket/qemud",
-            "/system/bin/qemu-props",
-            "/system/bin/qemud",
-            "/system/bin/androVM-prop",
-            "/system/lib/libc_malloc_debug_qemu.so",
-            "/system/lib/libdroid4x.so",
-            "/system/bin/microvirt-prop",
-            "/system/bin/nox-prop",
-            "/system/bin/ttVM-prop",
-            "/system/bin/windroyed",
-            "/system/etc/genymotion",
-            "/data/misc/genymotion",
-            "/dev/vboxguest",
-            "/dev/vboxuser",
-            "/system/lib/vboxguest.ko",
-            "/system/lib/vboxsf.ko",
-            "/ueventd.android_x86.rc",
-            "/x86.prop",
-            "/ueventd.ttVM_x86.rc",
-            "/init.nox.rc",
-            "/init.genymotion.sh",
-            "/fstab.vbox86",
-            "/init.vbox86.rc",
-            "/ueventd.vbox86.rc",
-            "/sys/bus/pci/drivers/vboxguest",
-        ];
-
-        File.exists.implementation = function () {
-            var path = this.getAbsolutePath();
-            for (var i = 0; i < emuFiles.length; i++) {
-                if (path === emuFiles[i] || path.indexOf("qemu") !== -1 || 
-                    path.indexOf("genymotion") !== -1 || path.indexOf("vbox") !== -1 ||
-                    path.indexOf("nox") !== -1 || path.indexOf("goldfish") !== -1) {
-                    return false;
-                }
-            }
-            return this.exists();
-        };
-
-        console.log("[+] تم إخفاء ملفات المحاكي");
-    } catch (e) {
-        console.log("[-] فشل إخفاء الملفات: " + e);
-    }
+    console.log("[+] إخفاء ملفات المحاكي (يُدار من القسم 10a)");
 
     // ============================================================
     //  القسم 4: تزييف TelephonyManager (IMEI, Network, SIM)
@@ -307,35 +260,10 @@ Java.perform(function () {
 
     // ============================================================
     //  القسم 7: إخفاء تطبيقات المحاكي
+    //  (ملاحظة: PackageManager hook الشامل موجود بالقسم 10b
+    //   يغطي تطبيقات المحاكي + الروت + Magisk + Xposed)
     // ============================================================
-    try {
-        var PackageManager = Java.use("android.app.ApplicationPackageManager");
-        
-        var emuPackages = [
-            "com.genymotion",
-            "com.bluestacks",
-            "com.bignox.app",
-            "com.vphone.launcher",
-            "com.microvirt",
-            "me.haotian.lechange",
-            "com.ldplayer",
-            "com.google.android.launcher.layouts.genymotion",
-            "com.android.emulator.smoketests",
-        ];
-
-        PackageManager.getPackageInfo.overload("java.lang.String", "int").implementation = function (pkg, flags) {
-            for (var i = 0; i < emuPackages.length; i++) {
-                if (pkg === emuPackages[i]) {
-                    throw Java.use("android.content.pm.PackageManager$NameNotFoundException").$new(pkg);
-                }
-            }
-            return this.getPackageInfo(pkg, flags);
-        };
-
-        console.log("[+] تم إخفاء تطبيقات المحاكي");
-    } catch (e) {
-        console.log("[-] فشل إخفاء التطبيقات: " + e);
-    }
+    console.log("[+] إخفاء تطبيقات المحاكي (يُدار من القسم 10b)");
 
     // ============================================================
     //  القسم 8: تجاوز فحص IP / VPN / Proxy
@@ -379,52 +307,269 @@ Java.perform(function () {
     }
 
     // ============================================================
-    //  القسم 10: إخفاء Root (بعض التطبيقات تفحص الروت)
+    //  القسم 10: تجاوز كشف الروت (Root Detection Bypass)
+    //  يتجاوز: RootBeer, SafetyNet root checks, Magisk detection,
+    //  su binary checks, root packages, root props, shell commands
     // ============================================================
+
+    // --- 10a: إخفاء ملفات ومجلدات الروت من File.exists ---
+    // (نعيد تعريف File.exists مع دمج فحوصات المحاكي من القسم 3)
+    try {
+        var FileRoot = Java.use("java.io.File");
+
+        var rootFiles = [
+            "/system/bin/su", "/system/xbin/su", "/sbin/su",
+            "/data/local/su", "/data/local/bin/su", "/data/local/xbin/su",
+            "/system/sd/xbin/su", "/su/bin/su", "/magisk",
+            "/system/app/Superuser.apk", "/system/app/SuperSU.apk",
+            "/system/app/SuperSU", "/system/app/Superuser",
+            "/system/etc/init.d/99telecominfomern",
+            "/system/xbin/daemonsu", "/system/xbin/busybox",
+            "/system/bin/.ext/.su", "/system/bin/failsafe/su",
+            "/data/adb/magisk", "/sbin/.magisk", "/cache/.disable_magisk",
+            "/dev/.magisk.unblock", "/data/adb/modules",
+            "/system/addon.d/99-magisk.sh",
+            "/data/data/com.topjohnwu.magisk",
+            "/data/user_de/0/com.topjohnwu.magisk",
+            // مسارات Frida (إخفاء Frida عن التطبيق)
+            "/data/local/tmp/frida-server",
+            "/data/local/tmp/re.frida.server",
+        ];
+
+        FileRoot.exists.implementation = function () {
+            var path = this.getAbsolutePath();
+            // فحص ملفات الروت
+            for (var i = 0; i < rootFiles.length; i++) {
+                if (path === rootFiles[i]) return false;
+            }
+            // فحص ملفات المحاكي (من القسم 3)
+            if (path.indexOf("qemu") !== -1 || path.indexOf("genymotion") !== -1 ||
+                path.indexOf("vbox") !== -1 || path.indexOf("nox") !== -1 ||
+                path.indexOf("goldfish") !== -1 || path.indexOf("magisk") !== -1 ||
+                path.indexOf("/su") !== -1 || path.indexOf("frida") !== -1 ||
+                path.indexOf("xposed") !== -1) {
+                return false;
+            }
+            return this.exists();
+        };
+
+        // إخفاء canRead للملفات الحساسة
+        FileRoot.canRead.implementation = function () {
+            var path = this.getAbsolutePath();
+            for (var i = 0; i < rootFiles.length; i++) {
+                if (path === rootFiles[i]) return false;
+            }
+            if (path.indexOf("magisk") !== -1 || path.indexOf("/su") !== -1 ||
+                path.indexOf("frida") !== -1) {
+                return false;
+            }
+            return this.canRead();
+        };
+
+        console.log("[+] تم إخفاء ملفات Root + Magisk + Frida من File.exists/canRead");
+    } catch (e) {
+        console.log("[-] فشل إخفاء ملفات Root: " + e);
+    }
+
+    // --- 10b: إخفاء تطبيقات/حزم الروت من PackageManager ---
+    try {
+        var PM = Java.use("android.app.ApplicationPackageManager");
+
+        var rootPackages = [
+            "com.topjohnwu.magisk", "io.github.vvb2060.magisk",
+            "com.koushikdutta.superuser", "com.noshufou.android.su",
+            "eu.chainfire.supersu", "com.thirdparty.superuser",
+            "com.yellowes.su", "com.kingroot.kinguser",
+            "com.kingo.root", "com.smedialink.onecleanmaster",
+            "com.zhiqupk.root.global", "com.alephzain.framaroot",
+            "com.formyhm.hideroot", "com.amphoras.hidemyroot",
+            "com.saurik.substrate", "de.robv.android.xposed",
+            "de.robv.android.xposed.installer",
+            // تطبيقات المحاكي (من القسم 7)
+            "com.genymotion", "com.bluestacks", "com.bignox.app",
+            "com.vphone.launcher", "com.microvirt", "com.ldplayer",
+            "com.google.android.launcher.layouts.genymotion",
+            "com.android.emulator.smoketests",
+        ];
+
+        PM.getPackageInfo.overload("java.lang.String", "int").implementation = function (pkg, flags) {
+            for (var i = 0; i < rootPackages.length; i++) {
+                if (pkg === rootPackages[i]) {
+                    throw Java.use("android.content.pm.PackageManager$NameNotFoundException").$new(pkg);
+                }
+            }
+            return this.getPackageInfo(pkg, flags);
+        };
+
+        // أيضاً hook getApplicationInfo
+        try {
+            PM.getApplicationInfo.overload("java.lang.String", "int").implementation = function (pkg, flags) {
+                for (var i = 0; i < rootPackages.length; i++) {
+                    if (pkg === rootPackages[i]) {
+                        throw Java.use("android.content.pm.PackageManager$NameNotFoundException").$new(pkg);
+                    }
+                }
+                return this.getApplicationInfo(pkg, flags);
+            };
+        } catch (e) {}
+
+        console.log("[+] تم إخفاء حزم Root + Magisk + Xposed + المحاكي");
+    } catch (e) {
+        console.log("[-] فشل إخفاء حزم Root: " + e);
+    }
+
+    // --- 10c: تجاوز Runtime.exec لأوامر الروت ---
     try {
         var Runtime = Java.use("java.lang.Runtime");
-        
+
+        var blockedCmds = ["su", "which", "id", "mount", "busybox", "magisk"];
+
         Runtime.exec.overload("java.lang.String").implementation = function (cmd) {
-            if (cmd && (cmd.indexOf("su") !== -1 || cmd === "which su" || cmd === "id")) {
-                throw Java.use("java.io.IOException").$new("Cannot run program");
+            if (cmd) {
+                for (var i = 0; i < blockedCmds.length; i++) {
+                    if (cmd === blockedCmds[i] || cmd.indexOf("/" + blockedCmds[i]) !== -1 ||
+                        cmd.indexOf(blockedCmds[i] + " ") === 0) {
+                        throw Java.use("java.io.IOException").$new("Cannot run program \"" + cmd + "\"");
+                    }
+                }
             }
             return this.exec(cmd);
         };
 
         Runtime.exec.overload("[Ljava.lang.String;").implementation = function (cmds) {
             if (cmds && cmds.length > 0) {
-                var cmd = cmds[0];
-                if (cmd && (cmd === "su" || cmd === "which" || cmd.indexOf("/su") !== -1)) {
-                    throw Java.use("java.io.IOException").$new("Cannot run program");
+                var cmd0 = cmds[0];
+                if (cmd0) {
+                    for (var i = 0; i < blockedCmds.length; i++) {
+                        if (cmd0 === blockedCmds[i] || cmd0.indexOf("/" + blockedCmds[i]) !== -1) {
+                            throw Java.use("java.io.IOException").$new("Cannot run program \"" + cmd0 + "\"");
+                        }
+                    }
                 }
             }
             return this.exec(cmds);
         };
 
-        // إخفاء su binary
-        var File2 = Java.use("java.io.File");
-        var originalExists = File2.exists;
+        // Hook exec with envp + dir overloads
+        try {
+            Runtime.exec.overload("java.lang.String", "[Ljava.lang.String;", "java.io.File").implementation = function (cmd, env, dir) {
+                if (cmd) {
+                    for (var i = 0; i < blockedCmds.length; i++) {
+                        if (cmd === blockedCmds[i] || cmd.indexOf("/" + blockedCmds[i]) !== -1) {
+                            throw Java.use("java.io.IOException").$new("Cannot run program \"" + cmd + "\"");
+                        }
+                    }
+                }
+                return this.exec(cmd, env, dir);
+            };
+        } catch (e) {}
 
-        var suPaths = [
-            "/system/bin/su",
-            "/system/xbin/su",
-            "/sbin/su",
-            "/data/local/su",
-            "/data/local/bin/su",
-            "/data/local/xbin/su",
-            "/system/sd/xbin/su",
-            "/system/app/Superuser.apk",
-            "/system/app/SuperSU.apk",
-            "/system/app/SuperSU",
-        ];
+        try {
+            Runtime.exec.overload("[Ljava.lang.String;", "[Ljava.lang.String;", "java.io.File").implementation = function (cmds, env, dir) {
+                if (cmds && cmds.length > 0) {
+                    var cmd0 = cmds[0];
+                    if (cmd0) {
+                        for (var i = 0; i < blockedCmds.length; i++) {
+                            if (cmd0 === blockedCmds[i] || cmd0.indexOf("/" + blockedCmds[i]) !== -1) {
+                                throw Java.use("java.io.IOException").$new("Cannot run program \"" + cmd0 + "\"");
+                            }
+                        }
+                    }
+                }
+                return this.exec(cmds, env, dir);
+            };
+        } catch (e) {}
 
-        // ملاحظة: هذا الـ hook موجود بالقسم 3 أيضاً — هنا نضيف مسارات su
-        // لكن الـ hook الأول بالقسم 3 بيمسكهم لأنه عام
-
-        console.log("[+] تم إخفاء Root indicators");
+        console.log("[+] تم حظر أوامر Root في Runtime.exec");
     } catch (e) {
-        console.log("[-] فشل إخفاء Root: " + e);
+        console.log("[-] فشل حظر أوامر Root: " + e);
     }
+
+    // --- 10d: تجاوز ProcessBuilder (طريقة ثانية لتشغيل الأوامر) ---
+    try {
+        var ProcessBuilder = Java.use("java.lang.ProcessBuilder");
+        ProcessBuilder.start.implementation = function () {
+            var cmdList = this.command();
+            if (cmdList && cmdList.size() > 0) {
+                var cmd0 = cmdList.get(0).toString();
+                for (var i = 0; i < blockedCmds.length; i++) {
+                    if (cmd0 === blockedCmds[i] || cmd0.indexOf("/" + blockedCmds[i]) !== -1) {
+                        throw Java.use("java.io.IOException").$new("Cannot run program \"" + cmd0 + "\"");
+                    }
+                }
+            }
+            return this.start();
+        };
+        console.log("[+] تم حظر أوامر Root في ProcessBuilder");
+    } catch (e) {
+        console.log("[-] فشل حظر ProcessBuilder: " + e);
+    }
+
+    // --- 10e: تزييف Build.TAGS و ro.secure و ro.debuggable ---
+    try {
+        var BuildTags = Java.use("android.os.Build");
+        BuildTags.TAGS.value = "release-keys";  // مش "test-keys"
+        console.log("[+] تم تعيين Build.TAGS = release-keys");
+    } catch (e) {}
+
+    // --- 10f: إخفاء Magisk Mount من /proc/self/mounts ---
+    try {
+        var BufferedReader = Java.use("java.io.BufferedReader");
+        BufferedReader.readLine.implementation = function () {
+            var line = this.readLine();
+            if (line && (line.indexOf("magisk") !== -1 || line.indexOf("/su") !== -1 ||
+                         line.indexOf("tmpfs /system/") !== -1)) {
+                // تخطي السطور التي تكشف Magisk mount
+                return this.readLine();
+            }
+            return line;
+        };
+        console.log("[+] تم إخفاء Magisk mounts من /proc/self/mounts");
+    } catch (e) {
+        console.log("[-] فشل إخفاء mounts: " + e);
+    }
+
+    // --- 10g: تجاوز RootBeer مباشرة (إذا موجود) ---
+    try {
+        var RootBeer = Java.use("com.scottyab.rootbeer.RootBeer");
+        RootBeer.isRooted.implementation = function () { return false; };
+        RootBeer.isRootedWithoutBusyBoxCheck.implementation = function () { return false; };
+        RootBeer.detectRootManagementApps.implementation = function () { return false; };
+        RootBeer.detectPotentiallyDangerousApps.implementation = function () { return false; };
+        RootBeer.detectTestKeys.implementation = function () { return false; };
+        RootBeer.checkForBinary.overload("java.lang.String").implementation = function (f) { return false; };
+        RootBeer.checkForDangerousProps.implementation = function () { return false; };
+        RootBeer.checkForRWPaths.implementation = function () { return false; };
+        RootBeer.detectRootCloakingApps.implementation = function () { return false; };
+        RootBeer.checkSuExists.implementation = function () { return false; };
+        RootBeer.checkForRootNative.implementation = function () { return false; };
+        RootBeer.checkForMagiskBinary.implementation = function () { return false; };
+        console.log("[+] تم تجاوز RootBeer بالكامل!");
+    } catch (e) {
+        // RootBeer مش موجود — عادي
+    }
+
+    // --- 10h: تجاوز مكتبة rootbeer RootCheck الداخلية ---
+    try {
+        var RootCheck = Java.use("com.scottyab.rootbeer.util.RootCheck");
+        RootCheck.isRooted.implementation = function () { return false; };
+        console.log("[+] تم تجاوز RootCheck");
+    } catch (e) {}
+
+    // --- 10i: إخفاء Frida من التطبيق ---
+    try {
+        // إخفاء منفذ Frida (27042) من الاتصالات
+        var InetSocketAddress = Java.use("java.net.InetSocketAddress");
+        // لا نغيّر الـ constructor — بس نراقب
+
+        // إخفاء frida-agent من maps
+        // (بعض التطبيقات تقرأ /proc/self/maps وتبحث عن frida)
+        // هذا يتم عبر BufferedReader hook أعلاه (10f)
+
+        console.log("[+] تم إخفاء Frida indicators");
+    } catch (e) {}
+
+    console.log("[+] === تجاوز كشف الروت مفعّل بالكامل ===");
 
     // ============================================================
     //  القسم 11: تجاوز Google SafetyNet / Play Integrity

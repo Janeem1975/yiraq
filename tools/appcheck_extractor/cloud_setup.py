@@ -558,9 +558,55 @@ def step_5_install_frida_server():
 
     # التحقق هل Frida Server شغال
     result = adb_cmd("shell", "su", "-c", "ps | grep frida-server")
-    if result and "frida-server" in result.stdout:
+    if result and "frida-server" in result.stdout and "grep" not in result.stdout.strip().split('\n')[-1]:
         print(f"{G}[+] Frida Server شغال مسبقاً!{RESET}")
         return True
+
+    # التحقق هل frida-server موجود على الجهاز (ممكن المستخدم نقله يدوياً)
+    result = adb_cmd("shell", "su", "-c", "ls -la /data/local/tmp/frida-server 2>/dev/null", timeout=10)
+    frida_on_device = False
+    if result and result.returncode == 0 and "/data/local/tmp/frida-server" in result.stdout:
+        # التحقق من الحجم
+        try:
+            size_str = result.stdout.strip().split()[4] if len(result.stdout.strip().split()) > 4 else "0"
+            remote_size = int(size_str)
+            if remote_size > 1_000_000:
+                print(f"{G}[+] frida-server موجود على الجهاز ({remote_size / 1024 / 1024:.1f} MB){RESET}")
+                frida_on_device = True
+        except (ValueError, IndexError):
+            pass
+
+    if frida_on_device:
+        # الملف موجود — نشغله مباشرة بدون ما ننزل أو ندفع
+        print(f"{C}[*] جاري تشغيل frida-server الموجود على الجهاز...{RESET}")
+        adb_cmd("shell", "su", "-c", "chmod 755 /data/local/tmp/frida-server")
+        adb_cmd("shell", "su", "-c", "setenforce 0 2>/dev/null")
+        adb_cmd("shell", "su", "-c", "pkill -f frida-server 2>/dev/null")
+        time.sleep(1)
+
+        adb_popen_cmd = ["adb"]
+        if DEVICE_SERIAL:
+            adb_popen_cmd.extend(["-s", DEVICE_SERIAL])
+        adb_popen_cmd.extend(["shell", "su", "-c", "/data/local/tmp/frida-server -D &"])
+        subprocess.Popen(adb_popen_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print(f"{C}[*] ننتظر Frida Server يبدأ...{RESET}")
+        time.sleep(3)
+
+        # فحص الاتصال
+        frida_check = ["frida-ps"]
+        if DEVICE_SERIAL:
+            frida_check.extend(["-D", DEVICE_SERIAL])
+        else:
+            frida_check.append("-U")
+
+        for attempt in range(3):
+            check = run_cmd(frida_check, timeout=10)
+            if check and check.returncode == 0 and "PID" in check.stdout:
+                print(f"{G}[+] Frida Server شغال ومتصل!{RESET}")
+                return True
+            time.sleep(3)
+
+        print(f"{Y}[!] frida-server موجود بس ما اشتغل — بنحاول ننزل نسخة جديدة{RESET}")
 
     # معرفة معمارية الجهاز
     result = adb_cmd("shell", "getprop", "ro.product.cpu.abi")
