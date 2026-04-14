@@ -81,6 +81,35 @@ def adb_cmd(*args, timeout=30):
     return run_cmd(cmd, timeout=timeout)
 
 
+def _find_serial_from_adb_devices():
+    """البحث عن سريال جهاز Genymotion من قائمة adb devices"""
+    global DEVICE_SERIAL
+    result = run_cmd(["adb", "devices"])
+    if not result or not result.stdout:
+        return False
+    print(f"{C}    الأجهزة المتصلة: {result.stdout.strip()}{RESET}")
+    for line in result.stdout.strip().split('\n'):
+        line = line.strip()
+        if 'localhost:' in line and 'device' in line:
+            new_serial = line.split()[0]
+            if new_serial != DEVICE_SERIAL:
+                print(f"{Y}    السريال تغيّر: {DEVICE_SERIAL} → {new_serial}{RESET}")
+            DEVICE_SERIAL = new_serial
+            return True
+    return False
+
+
+def _test_adb_alive(retries=3):
+    """فحص هل ADB يستجيب مع عدة محاولات"""
+    for i in range(retries):
+        test = adb_cmd("shell", "echo", "ok", timeout=10)
+        if test and test.returncode == 0 and "ok" in test.stdout:
+            return True
+        if i < retries - 1:
+            time.sleep(3)
+    return False
+
+
 def ensure_adb_connected():
     """التحقق من اتصال ADB وإعادة الاتصال إذا انقطع"""
     global DEVICE_SERIAL
@@ -88,54 +117,62 @@ def ensure_adb_connected():
     if not DEVICE_SERIAL:
         return True
 
-    # فحص سريع: هل الجهاز متصل؟
-    result = run_cmd(["adb", "devices"])
-    if result and DEVICE_SERIAL in result.stdout and "device" in result.stdout:
-        # تحقق إضافي: هل يستجيب فعلاً؟
-        test = adb_cmd("shell", "echo", "ok", timeout=5)
-        if test and test.returncode == 0 and "ok" in test.stdout:
-            return True
+    # فحص سريع: هل الجهاز متصل ويستجيب؟
+    if _test_adb_alive(retries=1):
+        return True
 
     print(f"{Y}[!] اتصال ADB انقطع — جاري إعادة الاتصال...{RESET}")
 
-    # إعادة الاتصال عبر gmsaas
+    # المحاولة 1: gmsaas instances adbconnect
     if INSTANCE_NAME:
+        print(f"{C}[*] محاولة 1: gmsaas instances adbconnect {INSTANCE_NAME}{RESET}")
         result = run_cmd(["gmsaas", "instances", "adbconnect", INSTANCE_NAME], timeout=60)
+        if result:
+            print(f"{C}    stdout: {result.stdout.strip()}{RESET}")
+            if result.stderr.strip():
+                print(f"{Y}    stderr: {result.stderr.strip()}{RESET}")
         if result and result.returncode == 0:
-            output = result.stdout.strip()
-            print(f"{G}[+] تم إعادة الاتصال!{RESET}")
-            # تحديث السريال إذا تغيّر
-            for line in output.split('\n'):
-                line = line.strip()
-                for part in line.split():
-                    if 'localhost:' in part:
-                        DEVICE_SERIAL = part
-                        break
-            time.sleep(2)
-            # تحقق نهائي
-            test = adb_cmd("shell", "echo", "ok", timeout=5)
-            if test and test.returncode == 0:
-                print(f"{G}[+] الجهاز متصل: {DEVICE_SERIAL}{RESET}")
+            # السريال ممكن يتغيّر — نأخذه من adb devices
+            time.sleep(3)
+            _find_serial_from_adb_devices()
+            if _test_adb_alive(retries=3):
+                print(f"{G}[+] تم إعادة الاتصال! الجهاز: {DEVICE_SERIAL}{RESET}")
                 return True
+            else:
+                print(f"{Y}[!] gmsaas نجح لكن ADB ما يستجيب بعد{RESET}")
 
-    # محاولة adb connect مباشر
+    # المحاولة 2: adb connect مباشر
     if DEVICE_SERIAL and 'localhost:' in DEVICE_SERIAL:
-        run_cmd(["adb", "connect", DEVICE_SERIAL], timeout=10)
-        time.sleep(2)
-        test = adb_cmd("shell", "echo", "ok", timeout=5)
-        if test and test.returncode == 0:
+        print(f"{C}[*] محاولة 2: adb connect {DEVICE_SERIAL}{RESET}")
+        result = run_cmd(["adb", "connect", DEVICE_SERIAL], timeout=10)
+        if result:
+            print(f"{C}    {result.stdout.strip()}{RESET}")
+        time.sleep(3)
+        if _test_adb_alive(retries=3):
             print(f"{G}[+] تم إعادة الاتصال بـ {DEVICE_SERIAL}{RESET}")
             return True
 
-    print(f"{R}[-] فشل إعادة اتصال ADB{RESET}")
-    print(f"{Y}    جرب يدوياً:{RESET}")
+    # المحاولة 3: adb devices لإيجاد أي جهاز localhost جديد
+    print(f"{C}[*] محاولة 3: البحث عن الجهاز بـ adb devices...{RESET}")
+    if _find_serial_from_adb_devices() and _test_adb_alive(retries=2):
+        print(f"{G}[+] لقينا الجهاز: {DEVICE_SERIAL}{RESET}")
+        return True
+
+    # كل المحاولات فشلت — طلب يدوي
+    print(f"\n{R}[-] فشلت كل محاولات إعادة الاتصال{RESET}")
+    print(f"{Y}    شغّل هالأمر بنافذة PowerShell ثانية:{RESET}")
     print(f"{C}    gmsaas instances adbconnect {INSTANCE_NAME or '<UUID>'}{RESET}")
+    print(f"{Y}    بعدها ارجع هنا واضغط Enter{RESET}")
     retry = input(f"{Y}اضغط Enter بعد إعادة الاتصال يدوياً (أو 'q' للإلغاء): {RESET}").strip()
     if retry.lower() == 'q':
         return False
-    # فحص أخير
-    test = adb_cmd("shell", "echo", "ok", timeout=5)
-    return test is not None and test.returncode == 0
+    # فحص بعد المحاولة اليدوية
+    _find_serial_from_adb_devices()
+    if _test_adb_alive(retries=3):
+        print(f"{G}[+] الجهاز متصل: {DEVICE_SERIAL}{RESET}")
+        return True
+    print(f"{R}[-] الجهاز مازال غير متصل{RESET}")
+    return False
 
 
 def check_tool(name, install_cmd=None):
@@ -660,12 +697,13 @@ def step_5_install_frida_server():
         return False
 
     # دفع Frida Server للجهاز
-    print(f"{C}[*] جاري دفع Frida Server للجهاز...{RESET}")
+    print(f"{C}[*] جاري دفع Frida Server للجهاز ({DEVICE_SERIAL})...{RESET}")
     result = adb_cmd("push", frida_local, "/data/local/tmp/frida-server", timeout=120)
     if not result or result.returncode != 0:
-        print(f"{R}[-] فشل دفع الملف{RESET}")
+        err_msg = ""
         if result:
-            print(f"{R}    {result.stderr}{RESET}")
+            err_msg = (result.stderr or "").strip() or (result.stdout or "").strip()
+        print(f"{R}[-] فشل دفع الملف: {err_msg}{RESET}")
         # محاولة إعادة اتصال ثم إعادة المحاولة
         print(f"{Y}[!] جاري إعادة اتصال ADB ومحاولة ثانية...{RESET}")
         if ensure_adb_connected():
