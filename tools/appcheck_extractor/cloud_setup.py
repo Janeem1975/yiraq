@@ -102,11 +102,54 @@ def _find_serial_from_adb_devices():
 def _test_adb_alive(retries=3):
     """فحص هل ADB يستجيب مع عدة محاولات"""
     for i in range(retries):
-        test = adb_cmd("shell", "echo", "ok", timeout=10)
+        test = adb_cmd("shell", "echo", "ok", timeout=20)
         if test and test.returncode == 0 and "ok" in test.stdout:
             return True
         if i < retries - 1:
+            time.sleep(4)
+    return False
+
+
+def adb_su(command, timeout=30):
+    """تشغيل أمر root على الجهاز — يمرر الأمر كسلسلة واحدة لـ su -c"""
+    # نجمع كل شي بأمر واحد عشان su -c يأخذه صح
+    return adb_cmd("shell", f"su -c '{command}'", timeout=timeout)
+
+
+def _start_frida_server():
+    """تشغيل frida-server الموجود على الجهاز والتحقق من اتصال Frida"""
+    print(f"{C}[*] جاري تشغيل frida-server...{RESET}")
+    adb_su("chmod 755 /data/local/tmp/frida-server")
+    adb_su("setenforce 0 2>/dev/null")
+    adb_su("pkill -f frida-server 2>/dev/null")
+    time.sleep(1)
+
+    # تشغيل frida-server بالخلفية
+    adb_popen_cmd = ["adb"]
+    if DEVICE_SERIAL:
+        adb_popen_cmd.extend(["-s", DEVICE_SERIAL])
+    adb_popen_cmd.extend(["shell", "su -c '/data/local/tmp/frida-server -D &'"])
+    subprocess.Popen(adb_popen_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    print(f"{C}[*] ننتظر Frida Server يبدأ...{RESET}")
+    time.sleep(4)
+
+    # فحص الاتصال — محاولات متعددة
+    frida_check = ["frida-ps"]
+    if DEVICE_SERIAL:
+        frida_check.extend(["-D", DEVICE_SERIAL])
+    else:
+        frida_check.append("-U")
+
+    for attempt in range(5):
+        check = run_cmd(frida_check, timeout=15)
+        if check and check.returncode == 0 and "PID" in check.stdout:
+            print(f"{G}[+] Frida Server شغال ومتصل!{RESET}")
+            return True
+        if attempt < 4:
+            print(f"{Y}[!] محاولة {attempt + 1}/5 — ننتظر...{RESET}")
             time.sleep(3)
+
+    print(f"{R}[-] Frida Server لم يستجب بعد 5 محاولات{RESET}")
     return False
 
 
@@ -557,56 +600,46 @@ def step_5_install_frida_server():
     print(f"{B}{'=' * 55}{RESET}\n")
 
     # التحقق هل Frida Server شغال
-    result = adb_cmd("shell", "su", "-c", "ps | grep frida-server")
+    result = adb_su("ps | grep frida-server")
     if result and "frida-server" in result.stdout and "grep" not in result.stdout.strip().split('\n')[-1]:
         print(f"{G}[+] Frida Server شغال مسبقاً!{RESET}")
-        return True
-
-    # التحقق هل frida-server موجود على الجهاز (ممكن المستخدم نقله يدوياً)
-    result = adb_cmd("shell", "su", "-c", "ls -la /data/local/tmp/frida-server 2>/dev/null", timeout=10)
-    frida_on_device = False
-    if result and result.returncode == 0 and "/data/local/tmp/frida-server" in result.stdout:
-        # التحقق من الحجم
-        try:
-            size_str = result.stdout.strip().split()[4] if len(result.stdout.strip().split()) > 4 else "0"
-            remote_size = int(size_str)
-            if remote_size > 1_000_000:
-                print(f"{G}[+] frida-server موجود على الجهاز ({remote_size / 1024 / 1024:.1f} MB){RESET}")
-                frida_on_device = True
-        except (ValueError, IndexError):
-            pass
-
-    if frida_on_device:
-        # الملف موجود — نشغله مباشرة بدون ما ننزل أو ندفع
-        print(f"{C}[*] جاري تشغيل frida-server الموجود على الجهاز...{RESET}")
-        adb_cmd("shell", "su", "-c", "chmod 755 /data/local/tmp/frida-server")
-        adb_cmd("shell", "su", "-c", "setenforce 0 2>/dev/null")
-        adb_cmd("shell", "su", "-c", "pkill -f frida-server 2>/dev/null")
-        time.sleep(1)
-
-        adb_popen_cmd = ["adb"]
-        if DEVICE_SERIAL:
-            adb_popen_cmd.extend(["-s", DEVICE_SERIAL])
-        adb_popen_cmd.extend(["shell", "su", "-c", "/data/local/tmp/frida-server -D &"])
-        subprocess.Popen(adb_popen_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(f"{C}[*] ننتظر Frida Server يبدأ...{RESET}")
-        time.sleep(3)
-
-        # فحص الاتصال
+        # تأكد إنو Frida يقدر يتصل فيه
         frida_check = ["frida-ps"]
         if DEVICE_SERIAL:
             frida_check.extend(["-D", DEVICE_SERIAL])
         else:
             frida_check.append("-U")
+        check = run_cmd(frida_check, timeout=15)
+        if check and check.returncode == 0 and "PID" in check.stdout:
+            print(f"{G}[+] Frida متصل بالجهاز!{RESET}")
+            return True
+        print(f"{Y}[!] Frida Server شغال لكن الاتصال فشل — بنعيد تشغيله{RESET}")
+        adb_su("pkill -f frida-server")
+        time.sleep(1)
 
-        for attempt in range(3):
-            check = run_cmd(frida_check, timeout=10)
-            if check and check.returncode == 0 and "PID" in check.stdout:
-                print(f"{G}[+] Frida Server شغال ومتصل!{RESET}")
-                return True
-            time.sleep(3)
+    # التحقق هل frida-server موجود على الجهاز (ممكن المستخدم نقله يدوياً)
+    result = adb_su("stat -c %s /data/local/tmp/frida-server 2>/dev/null || wc -c < /data/local/tmp/frida-server 2>/dev/null", timeout=15)
+    frida_on_device = False
+    if result and result.returncode == 0 and result.stdout.strip():
+        try:
+            remote_size = int(result.stdout.strip().split()[0])
+            if remote_size > 1_000_000:
+                print(f"{G}[+] frida-server موجود على الجهاز ({remote_size / 1024 / 1024:.1f} MB){RESET}")
+                frida_on_device = True
+        except (ValueError, IndexError):
+            pass
+    # فحص بديل بدون su
+    if not frida_on_device:
+        result = adb_cmd("shell", "ls -la /data/local/tmp/frida-server", timeout=15)
+        if result and result.returncode == 0 and "frida-server" in result.stdout and "No such" not in result.stdout:
+            print(f"{G}[+] frida-server موجود على الجهاز{RESET}")
+            frida_on_device = True
 
-        print(f"{Y}[!] frida-server موجود بس ما اشتغل — بنحاول ننزل نسخة جديدة{RESET}")
+    if frida_on_device:
+        if not _start_frida_server():
+            print(f"{Y}[!] frida-server موجود بس ما اشتغل — بنحاول ننزل نسخة جديدة{RESET}")
+        else:
+            return True
 
     # معرفة معمارية الجهاز
     result = adb_cmd("shell", "getprop", "ro.product.cpu.abi")
@@ -870,116 +903,124 @@ def step_5_install_frida_server():
 
     print(f"{G}[+] حجم الملف: {file_size / 1024 / 1024:.1f} MB — يبدو صحيح{RESET}")
 
-    # إيقاف أي frida-server قديم
-    adb_cmd("shell", "su", "-c", "pkill -f frida-server 2>/dev/null")
-    time.sleep(1)
-
     # إعادة اتصال ADB (قد ينقطع أثناء التنزيل اليدوي)
     if not ensure_adb_connected():
-        print(f"{R}[-] ADB غير متصل — ما نقدر ندفع Frida Server{RESET}")
+        print(f"{R}[-] ADB غير متصل — ما نقدر نكمل{RESET}")
         return False
 
-    # دفع Frida Server للجهاز
-    print(f"{C}[*] جاري دفع Frida Server للجهاز ({DEVICE_SERIAL})...{RESET}")
-    result = adb_cmd("push", frida_local, "/data/local/tmp/frida-server", timeout=120)
-    if not result or result.returncode != 0:
-        err_msg = ""
-        if result:
-            err_msg = (result.stderr or "").strip() or (result.stdout or "").strip()
-        print(f"{R}[-] فشل دفع الملف: {err_msg}{RESET}")
-        # محاولة إعادة اتصال ثم إعادة المحاولة
-        print(f"{Y}[!] جاري إعادة اتصال ADB ومحاولة ثانية...{RESET}")
-        if ensure_adb_connected():
-            result = adb_cmd("push", frida_local, "/data/local/tmp/frida-server", timeout=120)
-            if result and result.returncode == 0:
-                print(f"{G}[+] تم دفع الملف بعد إعادة الاتصال!{RESET}")
+    # === الأولوية 1: تنزيل مباشر على الجهاز (أسرع وأضمن من adb push) ===
+    download_url = f"https://github.com/frida/frida/releases/download/{FRIDA_VERSION}/{frida_xz}"
+    print(f"{C}[*] جاري تنزيل Frida Server مباشرة على الجهاز السحابي...{RESET}")
+
+    device_downloaded = False
+    # جرب wget أولاً
+    dl_result = adb_su(
+        f"wget -q -O /data/local/tmp/frida-server.xz '{download_url}' 2>&1",
+        timeout=120
+    )
+    if dl_result and dl_result.returncode == 0:
+        # فك الضغط على الجهاز
+        print(f"{C}[*] جاري فك الضغط على الجهاز...{RESET}")
+        adb_su("xz -d -f /data/local/tmp/frida-server.xz 2>/dev/null || unxz -f /data/local/tmp/frida-server.xz 2>/dev/null", timeout=60)
+        # تحقق من الملف
+        sz = adb_su("stat -c %s /data/local/tmp/frida-server 2>/dev/null", timeout=10)
+        if sz and sz.stdout.strip().isdigit() and int(sz.stdout.strip()) > 1_000_000:
+            print(f"{G}[+] تم التنزيل وفك الضغط على الجهاز مباشرة!{RESET}")
+            device_downloaded = True
+
+    # جرب curl إذا wget فشل
+    if not device_downloaded:
+        dl_result = adb_su(
+            f"curl -sL -o /data/local/tmp/frida-server.xz '{download_url}' 2>&1",
+            timeout=120
+        )
+        if dl_result and dl_result.returncode == 0:
+            print(f"{C}[*] جاري فك الضغط على الجهاز...{RESET}")
+            adb_su("xz -d -f /data/local/tmp/frida-server.xz 2>/dev/null || unxz -f /data/local/tmp/frida-server.xz 2>/dev/null", timeout=60)
+            sz = adb_su("stat -c %s /data/local/tmp/frida-server 2>/dev/null", timeout=10)
+            if sz and sz.stdout.strip().isdigit() and int(sz.stdout.strip()) > 1_000_000:
+                print(f"{G}[+] تم التنزيل وفك الضغط على الجهاز مباشرة!{RESET}")
+                device_downloaded = True
+
+    if not device_downloaded:
+        print(f"{Y}[!] التنزيل المباشر على الجهاز فشل — بنجرب adb push...{RESET}")
+
+    # === الأولوية 2: adb push من الكمبيوتر المحلي ===
+    if not device_downloaded:
+        # إيقاف أي frida-server قديم
+        adb_su("pkill -f frida-server 2>/dev/null")
+        time.sleep(1)
+
+        print(f"{C}[*] جاري دفع Frida Server للجهاز ({DEVICE_SERIAL})...{RESET}")
+        result = adb_cmd("push", frida_local, "/data/local/tmp/frida-server", timeout=300)
+        if not result or result.returncode != 0:
+            err_msg = ""
+            if result:
+                err_msg = (result.stderr or "").strip() or (result.stdout or "").strip()
+            print(f"{Y}[!] فشل adb push: {err_msg}{RESET}")
+
+            # محاولة إعادة اتصال ثم إعادة المحاولة
+            print(f"{C}[*] جاري إعادة اتصال ADB ومحاولة ثانية...{RESET}")
+            if ensure_adb_connected():
+                result = adb_cmd("push", frida_local, "/data/local/tmp/frida-server", timeout=300)
+                if result and result.returncode == 0:
+                    print(f"{G}[+] تم دفع الملف بعد إعادة الاتصال!{RESET}")
+                else:
+                    # === الأولوية 3: base64 streaming ===
+                    print(f"{Y}[!] adb push فشل — بنجرب طريقة base64...{RESET}")
+                    try:
+                        import base64
+                        with open(frida_local, 'rb') as f:
+                            data = f.read()
+                        # نرسل الملف بأجزاء صغيرة عبر echo + base64
+                        chunk_size = 48000  # ~64KB per base64 chunk
+                        adb_su("rm -f /data/local/tmp/frida-server", timeout=10)
+                        total_chunks = (len(data) + chunk_size - 1) // chunk_size
+                        for i in range(0, len(data), chunk_size):
+                            chunk = base64.b64encode(data[i:i+chunk_size]).decode()
+                            op = ">>" if i > 0 else ">"
+                            chunk_num = i // chunk_size + 1
+                            print(f"\r{C}[*] إرسال الجزء {chunk_num}/{total_chunks}...{RESET}", end="", flush=True)
+                            adb_su(f"echo {chunk} | base64 -d {op} /data/local/tmp/frida-server", timeout=30)
+                        print(f"\n{G}[+] تم إرسال الملف بطريقة base64!{RESET}")
+                    except Exception as b64_err:
+                        print(f"{R}[-] فشلت كل طرق نقل الملف: {b64_err}{RESET}")
+                        print(f"{Y}    انقل الملف يدوياً عبر واجهة Genymotion Cloud{RESET}")
+                        print(f"{Y}    أو شغّل frida-server يدوياً على الجهاز{RESET}")
+                        return False
             else:
-                print(f"{R}[-] فشل مرة ثانية{RESET}")
+                print(f"{R}[-] ADB غير متصل{RESET}")
                 return False
         else:
-            return False
-
-    print(f"{G}[+] تم دفع الملف!{RESET}")
-
-    # تعيين الصلاحيات
-    adb_cmd("shell", "su", "-c", "chmod 755 /data/local/tmp/frida-server")
-
-    # التحقق من وجود الملف على الجهاز
-    result = adb_cmd("shell", "su", "-c", "ls -la /data/local/tmp/frida-server")
-    if result:
-        print(f"{C}[*] {result.stdout.strip()}{RESET}")
-
-    # إعداد SELinux (مهم لـ Genymotion Cloud)
-    print(f"{C}[*] جاري تعطيل SELinux مؤقتاً (مطلوب لـ Frida)...{RESET}")
-    adb_cmd("shell", "su", "-c", "setenforce 0 2>/dev/null")
+            print(f"{G}[+] تم دفع الملف!{RESET}")
 
     # تشغيل Frida Server
-    print(f"{C}[*] جاري تشغيل Frida Server...{RESET}")
-    adb_popen_cmd = ["adb"]
-    if DEVICE_SERIAL:
-        adb_popen_cmd.extend(["-s", DEVICE_SERIAL])
-    adb_popen_cmd.extend(["shell", "su", "-c", "/data/local/tmp/frida-server -D &"])
-    subprocess.Popen(
-        adb_popen_cmd,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-    time.sleep(4)
+    if not _start_frida_server():
+        # فشل — نعطي تعليمات يدوية
+        serial_flag = f"-s {DEVICE_SERIAL} " if DEVICE_SERIAL else ""
+        print(f"{R}[-] Frida Server لم يشتغل!{RESET}")
+        print(f"{Y}    جرب يدوياً:{RESET}")
+        print(f"{C}    1. adb {serial_flag}shell \"su -c 'setenforce 0'\"{RESET}")
+        print(f"{C}    2. adb {serial_flag}shell \"su -c '/data/local/tmp/frida-server -D &'\"{RESET}")
+        print(f"{C}    3. frida-ps {'-D ' + DEVICE_SERIAL if DEVICE_SERIAL else '-U'}{RESET}")
+        print(f"{Y}    إذا الأمر الثالث طبع قائمة عمليات، يعني شغال{RESET}")
 
-    # التحقق — محاولات متعددة
-    for attempt in range(3):
-        result = adb_cmd("shell", "su", "-c", "ps | grep frida-server")
-        if result and "frida-server" in result.stdout:
-            print(f"{G}[+] Frida Server شغال!{RESET}")
-
-            # اختبار اتصال Frida
-            print(f"{C}[*] جاري اختبار اتصال Frida...{RESET}")
+        retry = input(f"{Y}هل شغّلته يدوياً وتريد الاستمرار؟ (y/n): {RESET}").strip().lower()
+        if retry == 'y':
             frida_test_cmd = ["frida-ps"]
             if DEVICE_SERIAL:
                 frida_test_cmd.extend(["-D", DEVICE_SERIAL])
             else:
                 frida_test_cmd.append("-U")
-            test_result = run_cmd(frida_test_cmd, timeout=10)
+            test_result = run_cmd(frida_test_cmd, timeout=15)
             if test_result and test_result.returncode == 0:
-                print(f"{G}[+] Frida متصل بالجهاز بنجاح!{RESET}")
+                print(f"{G}[+] Frida متصل بنجاح!{RESET}")
                 return True
             else:
-                print(f"{Y}[!] Frida Server شغال لكن الاتصال فشل{RESET}")
-                if test_result:
-                    print(f"{R}    {test_result.stderr}{RESET}")
-                # ننتظر ونجرب مرة ثانية
-                time.sleep(2)
-                continue
-
-        if attempt < 2:
-            print(f"{Y}[!] محاولة {attempt + 1}/3 — ننتظر...{RESET}")
-            time.sleep(3)
-
-    # فشل — نعطي تعليمات يدوية
-    serial_flag = f"-s {DEVICE_SERIAL} " if DEVICE_SERIAL else ""
-    print(f"{R}[-] Frida Server لم يشتغل!{RESET}")
-    print(f"{Y}    جرب يدوياً:{RESET}")
-    print(f"{C}    1. adb {serial_flag}shell su -c 'setenforce 0'{RESET}")
-    print(f"{C}    2. adb {serial_flag}shell su -c '/data/local/tmp/frida-server -D &'{RESET}")
-    print(f"{C}    3. frida-ps {'-D ' + DEVICE_SERIAL if DEVICE_SERIAL else '-U'}{RESET}")
-    print(f"{Y}    إذا الأمر الثالث طبع قائمة عمليات، يعني شغال{RESET}")
-
-    retry = input(f"{Y}هل شغّلته يدوياً وتريد الاستمرار؟ (y/n): {RESET}").strip().lower()
-    if retry == 'y':
-        # تحقق أخير
-        frida_test_cmd = ["frida-ps"]
-        if DEVICE_SERIAL:
-            frida_test_cmd.extend(["-D", DEVICE_SERIAL])
-        else:
-            frida_test_cmd.append("-U")
-        test_result = run_cmd(frida_test_cmd, timeout=10)
-        if test_result and test_result.returncode == 0:
-            print(f"{G}[+] Frida متصل بنجاح!{RESET}")
-            return True
-        else:
-            print(f"{R}[-] مازال غير متصل{RESET}")
-            return False
-    return False
+                print(f"{R}[-] مازال غير متصل{RESET}")
+                return False
+        return False
+    return True
 
 
 def step_6_extract_token():
