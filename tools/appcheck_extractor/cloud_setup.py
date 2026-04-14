@@ -1,0 +1,2062 @@
+#!/usr/bin/env python3
+"""
+إعداد Genymotion Cloud + سحب توكن AppCheck
+============================================
+
+هذا السكربت يساعدك خطوة بخطوة:
+1. إعداد Genymotion Cloud (gmsaas)
+2. تشغيل جهاز سحابي مروّت
+3. تنصيب تطبيق عين العراق
+4. تنصيب Frida Server
+5. سحب التوكن تلقائياً
+
+المتطلبات:
+    pip install gmsaas frida-tools mitmproxy
+
+الاستخدام:
+    python cloud_setup.py
+"""
+
+import subprocess
+import sys
+import os
+import time
+import json
+import platform
+import shutil
+import tempfile
+from pathlib import Path
+
+# ألوان الطرفية
+R = '\033[91m'
+G = '\033[92m'
+Y = '\033[93m'
+C = '\033[96m'
+B = '\033[1m'
+RESET = '\033[0m'
+
+PACKAGE_NAME = "com.moi.ayniq"
+FRIDA_SCRIPT = os.path.join(os.path.dirname(__file__), "hook_appcheck.js")
+BYPASS_SCRIPT = os.path.join(os.path.dirname(__file__), "bypass_emulator.js")
+TOKEN_FILE_ON_DEVICE = "/sdcard/appcheck_token.txt"
+LOCAL_TOKEN_FILE = os.path.join(os.path.dirname(__file__), "appcheck_token.txt")
+
+# إصدار Frida المطلوب (عدّله حسب إصدار frida-tools عندك)
+FRIDA_VERSION = "17.3.2"
+
+
+def print_banner():
+    print(f"""
+{C}╔══════════════════════════════════════════════════════╗
+║   سحب توكن AppCheck - Genymotion Cloud              ║
+║   AppCheck Extractor - Cloud Edition                 ║
+╚══════════════════════════════════════════════════════╝{RESET}
+""")
+
+
+# متغيرات عامة
+DEVICE_SERIAL = None
+INSTANCE_NAME = None  # UUID الجهاز السحابي لإعادة الاتصال
+SHELL_IS_ROOT = None  # هل الـ shell أصلاً root (بدون su)
+GADGET_MODE = False   # هل نستخدم Frida Gadget (بدون root)
+TOOLS_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def run_cmd(cmd, capture=True, timeout=30):
+    """تشغيل أمر مع التقاط المخرجات"""
+    try:
+        result = subprocess.run(
+            cmd, capture_output=capture, text=True, timeout=timeout
+        )
+        return result
+    except FileNotFoundError:
+        return None
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def adb_cmd(*args, timeout=30):
+    """تشغيل أمر ADB مع تحديد الجهاز تلقائياً بـ -s"""
+    cmd = ["adb"]
+    if DEVICE_SERIAL:
+        cmd.extend(["-s", DEVICE_SERIAL])
+    cmd.extend(args)
+    return run_cmd(cmd, timeout=timeout)
+
+
+def _find_serial_from_adb_devices():
+    """البحث عن سريال جهاز Genymotion من قائمة adb devices"""
+    global DEVICE_SERIAL
+    result = run_cmd(["adb", "devices"])
+    if not result or not result.stdout:
+        return False
+    print(f"{C}    الأجهزة المتصلة: {result.stdout.strip()}{RESET}")
+    for line in result.stdout.strip().split('\n'):
+        line = line.strip()
+        if 'localhost:' in line and 'device' in line:
+            new_serial = line.split()[0]
+            if new_serial != DEVICE_SERIAL:
+                print(f"{Y}    السريال تغيّر: {DEVICE_SERIAL} → {new_serial}{RESET}")
+            DEVICE_SERIAL = new_serial
+            return True
+    return False
+
+
+def _test_adb_alive(retries=3):
+    """فحص هل ADB يستجيب مع عدة محاولات"""
+    for i in range(retries):
+        test = adb_cmd("shell", "echo", "ok", timeout=20)
+        if test and test.returncode == 0 and "ok" in test.stdout:
+            return True
+        if i < retries - 1:
+            time.sleep(4)
+    return False
+
+
+def _detect_root_shell():
+    """كشف إذا الـ shell أصلاً root وتصعيد الصلاحيات إذا لزم"""
+    global SHELL_IS_ROOT, DEVICE_SERIAL, GADGET_MODE
+
+    # فحص 1: هل الـ shell أصلاً root
+    result = adb_cmd("shell", "id", timeout=10)
+    if result and result.returncode == 0 and "uid=0" in result.stdout:
+        SHELL_IS_ROOT = True
+        print(f"{G}[+] Shell أصلاً root — ما نحتاج su{RESET}")
+        return True
+
+    # فحص 2: تصعيد بـ adb root (يعيد تشغيل adbd كـ root)
+    print(f"{C}[*] جاري تصعيد الصلاحيات بـ adb root...{RESET}")
+    root_result = adb_cmd("root", timeout=15)
+    root_output = ""
+    if root_result:
+        root_output = (root_result.stdout.strip() + " " + root_result.stderr.strip()).strip()
+        print(f"{C}    adb root: {root_output}{RESET}")
+
+    # كشف الجهاز غير المروّت
+    if "not rooted" in root_output.lower() or "cannot run as root" in root_output.lower():
+        SHELL_IS_ROOT = False
+        GADGET_MODE = True
+        print(f"{Y}[!] الجهاز غير مروّت — سننتقل لوضع Frida Gadget (بدون root){RESET}")
+        print(f"{C}    Gadget يحقن Frida داخل التطبيق مباشرة — أقوى من frida-server{RESET}")
+        return False  # False = لا يوجد root
+
+    time.sleep(3)  # انتظر adbd يعيد تشغيل
+
+    # إعادة اتصال ADB بعد adb root (ضروري للأجهزة السحابية)
+    if DEVICE_SERIAL and "localhost:" in DEVICE_SERIAL and INSTANCE_NAME:
+        print(f"{C}[*] إعادة اتصال ADB بعد التصعيد...{RESET}")
+        reconn = run_cmd(["gmsaas", "instances", "adbconnect", INSTANCE_NAME], timeout=30)
+        if reconn and reconn.returncode == 0:
+            # تحديث السريال إذا تغيّر
+            out = reconn.stdout.strip()
+            for line in out.split('\n'):
+                if 'localhost:' in line:
+                    new_serial = line.strip().split()[0] if line.strip() else None
+                    if new_serial and 'localhost:' in new_serial:
+                        DEVICE_SERIAL = new_serial
+            print(f"{G}[+] تم إعادة الاتصال: {DEVICE_SERIAL}{RESET}")
+        time.sleep(2)
+
+    # فحص ثاني بعد adb root
+    result = adb_cmd("shell", "id", timeout=10)
+    if result and result.returncode == 0 and "uid=0" in result.stdout:
+        SHELL_IS_ROOT = True
+        print(f"{G}[+] adb root نجح! Shell الآن root{RESET}")
+        return True
+
+    # فحص 3: su -c
+    result = adb_cmd("shell", "su -c 'id'", timeout=10)
+    if result and result.returncode == 0 and "uid=0" in result.stdout:
+        SHELL_IS_ROOT = False
+        print(f"{G}[+] su شغال — نستخدمه للأوامر{RESET}")
+        return True
+
+    # فحص 4: su 0
+    result = adb_cmd("shell", "su 0 id", timeout=10)
+    if result and result.returncode == 0 and "uid=0" in result.stdout:
+        SHELL_IS_ROOT = False
+        print(f"{G}[+] su 0 شغال{RESET}")
+        return True
+
+    # ما لقينا root بأي طريقة — ننتقل لوضع Gadget
+    SHELL_IS_ROOT = False
+    GADGET_MODE = True
+    print(f"{Y}[!] ما قدرنا نحصل على root بأي طريقة{RESET}")
+    print(f"{C}    سننتقل لوضع Frida Gadget — يحقن Frida داخل التطبيق (بدون root){RESET}")
+    return False
+
+
+def adb_su(command, timeout=30):
+    """تشغيل أمر root على الجهاز — يكتشف تلقائياً إذا يحتاج su أو لا"""
+    global SHELL_IS_ROOT
+    if SHELL_IS_ROOT is None:
+        _detect_root_shell()
+    if SHELL_IS_ROOT:
+        # الـ shell أصلاً root — نشغل الأمر مباشرة
+        return adb_cmd("shell", command, timeout=timeout)
+    else:
+        return adb_cmd("shell", f"su -c '{command}'", timeout=timeout)
+
+
+def _start_frida_server():
+    """تشغيل frida-server الموجود على الجهاز والتحقق من اتصال Frida"""
+    global SHELL_IS_ROOT
+    if SHELL_IS_ROOT is None:
+        _detect_root_shell()
+
+    print(f"{C}[*] جاري تشغيل frida-server...{RESET}")
+
+    # فحص هل frida-server يشتغل كـ root
+    fs_check = adb_cmd("shell", "ps -eo pid,user,args 2>/dev/null | grep frida-server | grep -v grep", timeout=5)
+    if fs_check and fs_check.stdout.strip():
+        print(f"{C}[*] حالة frida-server: {fs_check.stdout.strip()}{RESET}")
+        if "root" in fs_check.stdout:
+            # frida-server شغال كـ root — نتحقق بـ frida-ps
+            frida_check = ["frida-ps"]
+            if DEVICE_SERIAL:
+                frida_check.extend(["-D", DEVICE_SERIAL])
+            else:
+                frida_check.append("-U")
+            check = run_cmd(frida_check, timeout=10)
+            if check and check.returncode == 0 and "PID" in check.stdout:
+                print(f"{G}[+] Frida Server أصلاً شغال كـ root!{RESET}")
+                return True
+        # شغال بس مش كـ root — نوقفه ونعيد
+        print(f"{Y}[!] frida-server شغال بس مش كـ root — نعيد تشغيله{RESET}")
+
+    # إيقاف أي نسخة قديمة أولاً (بكل الطرق الممكنة)
+    for kill_cmd in ["pkill -9 -f frida-server", "killall frida-server"]:
+        adb_su(kill_cmd + " 2>/dev/null")
+    time.sleep(1)
+
+    # تعيين الصلاحيات وتعطيل SELinux
+    adb_su("chmod 755 /data/local/tmp/frida-server")
+    adb_su("setenforce 0 2>/dev/null")
+
+    # تشغيل frida-server بعدة طرق حسب نوع الـ root
+    started = False
+    start_methods = []
+
+    if SHELL_IS_ROOT:
+        # الـ shell أصلاً root
+        start_methods = [
+            ["shell", "/data/local/tmp/frida-server -D"],
+            ["shell", "nohup /data/local/tmp/frida-server -D &"],
+            ["shell", "/data/local/tmp/frida-server -l 0.0.0.0:27042 -D"],
+        ]
+    else:
+        # نحتاج su
+        start_methods = [
+            ["shell", "su -c '/data/local/tmp/frida-server -D'"],
+            ["shell", "su -c 'nohup /data/local/tmp/frida-server -D &'"],
+            ["shell", "su -c '/data/local/tmp/frida-server -l 0.0.0.0:27042 -D'"],
+            ["shell", "su 0 /data/local/tmp/frida-server -D"],
+        ]
+
+    for method_args in start_methods:
+        adb_popen_cmd = ["adb"]
+        if DEVICE_SERIAL:
+            adb_popen_cmd.extend(["-s", DEVICE_SERIAL])
+        adb_popen_cmd.extend(method_args)
+        print(f"{C}[*] طريقة التشغيل: {' '.join(method_args)}{RESET}")
+        subprocess.Popen(adb_popen_cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(3)
+
+        # فحص سريع — frida-ps + التحقق من صلاحيات العملية
+        frida_check = ["frida-ps"]
+        if DEVICE_SERIAL:
+            frida_check.extend(["-D", DEVICE_SERIAL])
+        else:
+            frida_check.append("-U")
+        check = run_cmd(frida_check, timeout=10)
+        if check and check.returncode == 0 and "PID" in check.stdout:
+            # تحقق إضافي: هل يشتغل كـ root
+            uid_check = adb_cmd("shell", "ps -eo pid,user,args 2>/dev/null | grep frida-server | grep -v grep", timeout=5)
+            if uid_check and uid_check.stdout.strip():
+                print(f"{C}    عملية frida-server: {uid_check.stdout.strip()}{RESET}")
+                if "root" in uid_check.stdout:
+                    print(f"{G}[+] Frida Server شغال كـ root!{RESET}")
+                    started = True
+                    break
+                else:
+                    print(f"{Y}[!] frida-server شغال بس مش كـ root — نجرب طريقة ثانية{RESET}")
+            else:
+                # ما قدرنا نتحقق من الصلاحيات — نقبل
+                print(f"{G}[+] Frida Server شغال ومتصل!{RESET}")
+                started = True
+                break
+        # إذا ما اشتغل، نوقفه ونجرب الطريقة التالية
+        for kill_cmd in ["pkill -9 -f frida-server", "killall frida-server"]:
+            adb_su(kill_cmd + " 2>/dev/null")
+        time.sleep(1)
+
+    if started:
+        return True
+
+    # محاولة أخيرة — ننتظر أكثر
+    print(f"{Y}[!] ننتظر أكثر لـ Frida Server...{RESET}")
+    time.sleep(5)
+    frida_check = ["frida-ps"]
+    if DEVICE_SERIAL:
+        frida_check.extend(["-D", DEVICE_SERIAL])
+    else:
+        frida_check.append("-U")
+    check = run_cmd(frida_check, timeout=15)
+    if check and check.returncode == 0 and "PID" in check.stdout:
+        print(f"{G}[+] Frida Server شغال ومتصل!{RESET}")
+        return True
+
+    print(f"{R}[-] Frida Server لم يشتغل بأي طريقة{RESET}")
+    return False
+
+
+def ensure_adb_connected():
+    """التحقق من اتصال ADB وإعادة الاتصال إذا انقطع"""
+    global DEVICE_SERIAL
+
+    if not DEVICE_SERIAL:
+        return True
+
+    # فحص سريع: هل الجهاز متصل ويستجيب؟
+    if _test_adb_alive(retries=1):
+        return True
+
+    print(f"{Y}[!] اتصال ADB انقطع — جاري إعادة الاتصال...{RESET}")
+
+    # المحاولة 1: gmsaas instances adbconnect
+    if INSTANCE_NAME:
+        print(f"{C}[*] محاولة 1: gmsaas instances adbconnect {INSTANCE_NAME}{RESET}")
+        result = run_cmd(["gmsaas", "instances", "adbconnect", INSTANCE_NAME], timeout=60)
+        if result:
+            print(f"{C}    stdout: {result.stdout.strip()}{RESET}")
+            if result.stderr.strip():
+                print(f"{Y}    stderr: {result.stderr.strip()}{RESET}")
+        if result and result.returncode == 0:
+            # السريال ممكن يتغيّر — نأخذه من adb devices
+            time.sleep(3)
+            _find_serial_from_adb_devices()
+            if _test_adb_alive(retries=3):
+                print(f"{G}[+] تم إعادة الاتصال! الجهاز: {DEVICE_SERIAL}{RESET}")
+                return True
+            else:
+                print(f"{Y}[!] gmsaas نجح لكن ADB ما يستجيب بعد{RESET}")
+
+    # المحاولة 2: adb connect مباشر
+    if DEVICE_SERIAL and 'localhost:' in DEVICE_SERIAL:
+        print(f"{C}[*] محاولة 2: adb connect {DEVICE_SERIAL}{RESET}")
+        result = run_cmd(["adb", "connect", DEVICE_SERIAL], timeout=10)
+        if result:
+            print(f"{C}    {result.stdout.strip()}{RESET}")
+        time.sleep(3)
+        if _test_adb_alive(retries=3):
+            print(f"{G}[+] تم إعادة الاتصال بـ {DEVICE_SERIAL}{RESET}")
+            return True
+
+    # المحاولة 3: adb devices لإيجاد أي جهاز localhost جديد
+    print(f"{C}[*] محاولة 3: البحث عن الجهاز بـ adb devices...{RESET}")
+    if _find_serial_from_adb_devices() and _test_adb_alive(retries=2):
+        print(f"{G}[+] لقينا الجهاز: {DEVICE_SERIAL}{RESET}")
+        return True
+
+    # كل المحاولات فشلت — طلب يدوي
+    print(f"\n{R}[-] فشلت كل محاولات إعادة الاتصال{RESET}")
+    print(f"{Y}    شغّل هالأمر بنافذة PowerShell ثانية:{RESET}")
+    print(f"{C}    gmsaas instances adbconnect {INSTANCE_NAME or '<UUID>'}{RESET}")
+    print(f"{Y}    بعدها ارجع هنا واضغط Enter{RESET}")
+    retry = input(f"{Y}اضغط Enter بعد إعادة الاتصال يدوياً (أو 'q' للإلغاء): {RESET}").strip()
+    if retry.lower() == 'q':
+        return False
+    # فحص بعد المحاولة اليدوية
+    _find_serial_from_adb_devices()
+    if _test_adb_alive(retries=3):
+        print(f"{G}[+] الجهاز متصل: {DEVICE_SERIAL}{RESET}")
+        return True
+    print(f"{R}[-] الجهاز مازال غير متصل{RESET}")
+    return False
+
+
+def check_tool(name, install_cmd=None):
+    """التحقق من وجود أداة"""
+    if shutil.which(name):
+        print(f"{G}[+] {name} موجود{RESET}")
+        return True
+    else:
+        print(f"{R}[-] {name} غير موجود!{RESET}")
+        if install_cmd:
+            print(f"{Y}    نصّبه: {install_cmd}{RESET}")
+        return False
+
+
+def step_0_check_requirements():
+    """الخطوة 0: التحقق من المتطلبات"""
+    print(f"\n{B}{'=' * 55}{RESET}")
+    print(f"{B}  الخطوة 0: التحقق من المتطلبات{RESET}")
+    print(f"{B}{'=' * 55}{RESET}\n")
+
+    all_ok = True
+
+    # Python
+    print(f"{C}[*] Python: {sys.version.split()[0]}{RESET}")
+
+    # pip
+    if not check_tool("pip3", "تأكد من تنصيب Python بشكل صحيح"):
+        if not check_tool("pip"):
+            all_ok = False
+
+    # gmsaas
+    if not check_tool("gmsaas", "pip install gmsaas"):
+        all_ok = False
+
+    # adb
+    if not check_tool("adb", "نزّل Android SDK Platform Tools"):
+        all_ok = False
+
+    # frida
+    try:
+        import frida
+        print(f"{G}[+] frida موجود (إصدار: {frida.__version__}){RESET}")
+        global FRIDA_VERSION
+        FRIDA_VERSION = frida.__version__
+    except ImportError:
+        print(f"{R}[-] frida غير موجود!{RESET}")
+        print(f"{Y}    نصّبه: pip install frida-tools{RESET}")
+        all_ok = False
+
+    if not all_ok:
+        print(f"\n{R}[-] بعض المتطلبات ناقصة! نصّبها وأعد التشغيل{RESET}")
+        print(f"\n{Y}أمر التنصيب الشامل:{RESET}")
+        print(f"{C}    pip install gmsaas frida-tools mitmproxy{RESET}")
+        return False
+
+    print(f"\n{G}[+] كل المتطلبات موجودة!{RESET}")
+    return True
+
+
+def step_1_setup_gmsaas():
+    """الخطوة 1: إعداد gmsaas"""
+    print(f"\n{B}{'=' * 55}{RESET}")
+    print(f"{B}  الخطوة 1: إعداد Genymotion Cloud{RESET}")
+    print(f"{B}{'=' * 55}{RESET}\n")
+
+    # التحقق هل مسجّل دخول
+    result = run_cmd(["gmsaas", "auth", "whoami"])
+    if result and result.returncode == 0 and result.stdout.strip():
+        print(f"{G}[+] أنت مسجّل دخول: {result.stdout.strip()}{RESET}")
+        return True
+
+    print(f"{C}[*] لازم تسجّل دخول بـ Genymotion Cloud{RESET}")
+    print(f"""
+{Y}الخطوات:{RESET}
+{C}  1. روح على: https://cloud.geny.io/signin{RESET}
+{C}  2. سجّل حساب جديد أو سجّل دخول{RESET}
+{C}  3. روح على API section بالداشبورد{RESET}
+{C}  4. اضغط Create عشان تولّد API Token{RESET}
+{C}  5. انسخ التوكن (مهم! ما بتقدر تشوفه مرة ثانية){RESET}
+""")
+
+    token = input(f"{Y}الصق API Token هنا: {RESET}").strip()
+    if not token:
+        print(f"{R}[-] ما أدخلت توكن!{RESET}")
+        return False
+
+    result = run_cmd(["gmsaas", "auth", "token", token])
+    if result and result.returncode == 0:
+        print(f"{G}[+] تم تسجيل الدخول بنجاح!{RESET}")
+        return True
+    else:
+        print(f"{R}[-] فشل تسجيل الدخول! تأكد من التوكن{RESET}")
+        if result:
+            print(f"{R}    {result.stderr}{RESET}")
+        return False
+
+
+def step_1b_configure_sdk():
+    """تهيئة مسار Android SDK لـ gmsaas"""
+    # محاولة الكشف التلقائي عن مسار SDK
+    sdk_path = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
+
+    if not sdk_path:
+        # أماكن شائعة
+        if sys.platform == "win32":
+            candidates = [
+                os.path.expanduser(r"~\AppData\Local\Android\Sdk"),
+                r"C:\Android\Sdk",
+                r"C:\Users\Public\Android\Sdk",
+            ]
+        elif sys.platform == "darwin":
+            candidates = [
+                os.path.expanduser("~/Library/Android/sdk"),
+            ]
+        else:
+            candidates = [
+                os.path.expanduser("~/Android/Sdk"),
+                "/usr/lib/android-sdk",
+            ]
+
+        for c in candidates:
+            if os.path.exists(c):
+                sdk_path = c
+                break
+
+    if sdk_path and os.path.exists(sdk_path):
+        print(f"{G}[+] Android SDK: {sdk_path}{RESET}")
+        run_cmd(["gmsaas", "config", "set", "android-sdk-path", sdk_path])
+        return True
+    else:
+        print(f"{Y}[!] ما قدرت أكتشف مسار Android SDK تلقائياً{RESET}")
+        sdk_input = input(f"{Y}أدخل مسار Android SDK (أو اضغط Enter لتخطي): {RESET}").strip()
+        if sdk_input and os.path.exists(sdk_input):
+            run_cmd(["gmsaas", "config", "set", "android-sdk-path", sdk_input])
+            print(f"{G}[+] تم تعيين مسار SDK{RESET}")
+            return True
+        elif sdk_input:
+            print(f"{R}[-] المسار غير موجود: {sdk_input}{RESET}")
+            return False
+        else:
+            print(f"{Y}[!] تم التخطي — قد تحتاج تعيينه لاحقاً{RESET}")
+            return True
+
+
+def step_2_start_device():
+    """الخطوة 2: تشغيل جهاز سحابي"""
+    print(f"\n{B}{'=' * 55}{RESET}")
+    print(f"{B}  الخطوة 2: تشغيل جهاز سحابي مروّت{RESET}")
+    print(f"{B}{'=' * 55}{RESET}\n")
+
+    # التحقق هل في جهاز شغال
+    result = run_cmd(["gmsaas", "instances", "list"], timeout=30)
+    if result and result.returncode == 0 and result.stdout.strip():
+        lines = result.stdout.strip().split('\n')
+        if len(lines) > 1:  # في هيدر + أجهزة
+            print(f"{G}[+] في جهاز/أجهزة شغالة:{RESET}")
+            print(result.stdout)
+            use_existing = input(f"{Y}هل تريد استخدام جهاز موجود؟ (y/n): {RESET}").strip().lower()
+            if use_existing == 'y':
+                instance_name = input(f"{Y}أدخل اسم الجهاز: {RESET}").strip()
+                if instance_name:
+                    return instance_name
+
+    # عرض الوصفات المتاحة
+    print(f"{C}[*] جاري جلب الأجهزة المتاحة...{RESET}")
+    result = run_cmd(["gmsaas", "recipes", "list"], timeout=30)
+    if result and result.returncode == 0:
+        print(f"\n{C}الأجهزة المتاحة:{RESET}")
+        print(result.stdout[:3000])  # أول 3000 حرف
+    else:
+        print(f"{Y}[!] ما قدرت أجلب القائمة. بنستخدم وصفة افتراضية{RESET}")
+
+    print(f"""
+{C}نصيحة: اختر جهاز Android 11 أو 12 (x86_64) — أفضل توافق مع Frida{RESET}
+{C}مثال: Google Pixel 3 - Android 11{RESET}
+""")
+
+    recipe_uuid = input(f"{Y}أدخل UUID الوصفة (أو اضغط Enter للافتراضي): {RESET}").strip()
+
+    instance_name = f"ayniq-extractor-{int(time.time())}"
+
+    print(f"{C}[*] جاري تشغيل الجهاز ({instance_name})...{RESET}")
+    print(f"{Y}    هذا ممكن ياخذ 1-3 دقائق...{RESET}")
+
+    cmd = ["gmsaas", "instances", "start"]
+    if recipe_uuid:
+        cmd.append(recipe_uuid)
+    else:
+        # محاولة استخدام وصفة شائعة
+        cmd.append("google-pixel-3-11.0")
+    cmd.append(instance_name)
+
+    result = run_cmd(cmd, timeout=300)
+    if result and result.returncode == 0:
+        print(f"{G}[+] تم تشغيل الجهاز: {instance_name}{RESET}")
+        return instance_name
+    else:
+        print(f"{R}[-] فشل تشغيل الجهاز{RESET}")
+        if result:
+            print(f"{R}    {result.stderr}{RESET}")
+        print(f"{Y}    جرب تشغيله يدوياً:{RESET}")
+        print(f"{C}    gmsaas recipes list{RESET}")
+        print(f"{C}    gmsaas instances start <RECIPE_UUID> my-device{RESET}")
+        manual_name = input(f"{Y}أدخل اسم الجهاز اللي شغلته يدوياً (أو Enter للإلغاء): {RESET}").strip()
+        return manual_name if manual_name else None
+
+
+def step_3_connect_adb(instance_name):
+    """الخطوة 3: ربط ADB بالجهاز السحابي"""
+    global DEVICE_SERIAL, INSTANCE_NAME
+    INSTANCE_NAME = instance_name
+
+    print(f"\n{B}{'=' * 55}{RESET}")
+    print(f"{B}  الخطوة 3: ربط ADB بالجهاز السحابي{RESET}")
+    print(f"{B}{'=' * 55}{RESET}\n")
+
+    print(f"{C}[*] جاري ربط ADB بالجهاز...{RESET}")
+
+    result = run_cmd(["gmsaas", "instances", "adbconnect", instance_name], timeout=60)
+    if result and result.returncode == 0:
+        # استخراج سريال الجهاز من مخرجات gmsaas
+        output = result.stdout.strip()
+        print(f"{G}[+] تم ربط ADB!{RESET}")
+        print(f"{C}    {output}{RESET}")
+
+        # gmsaas عادة يطبع السريال مثل "localhost:61178"
+        for line in output.split('\n'):
+            line = line.strip()
+            if line.startswith('localhost:') or ':' in line:
+                # استخراج السريال (مثل localhost:61178)
+                parts = line.split()
+                for part in parts:
+                    if 'localhost:' in part or (':' in part and part[0].isdigit()):
+                        DEVICE_SERIAL = part
+                        break
+                if DEVICE_SERIAL:
+                    break
+    else:
+        print(f"{R}[-] فشل ربط ADB{RESET}")
+        if result:
+            print(f"{R}    {result.stderr}{RESET}")
+        print(f"{Y}    جرب يدوياً: gmsaas instances adbconnect {instance_name}{RESET}")
+        return False
+
+    # التحقق من الاتصال
+    time.sleep(2)
+    result = run_cmd(["adb", "devices"])
+    if result:
+        print(f"\n{C}الأجهزة المتصلة:{RESET}")
+        print(result.stdout)
+
+        # إذا ما قدرنا نستخرج السريال من gmsaas، نبحث عنه بقائمة الأجهزة
+        if not DEVICE_SERIAL:
+            for line in result.stdout.strip().split('\n'):
+                line = line.strip()
+                if 'localhost:' in line and 'device' in line:
+                    DEVICE_SERIAL = line.split()[0]
+                    break
+
+    if DEVICE_SERIAL:
+        print(f"{G}[+] سريال الجهاز المستهدف: {DEVICE_SERIAL}{RESET}")
+        print(f"{C}    كل أوامر ADB ستستهدف هذا الجهاز تحديداً{RESET}")
+    else:
+        print(f"{Y}[!] ما قدرت أحدد سريال الجهاز السحابي تلقائياً{RESET}")
+        serial_input = input(f"{Y}أدخل سريال الجهاز (مثل localhost:61178): {RESET}").strip()
+        if serial_input:
+            DEVICE_SERIAL = serial_input
+        else:
+            print(f"{Y}[!] سيتم استخدام ADB بدون تحديد جهاز — قد يستهدف جهاز خطأ{RESET}")
+
+    # كشف Root يتم لاحقاً بالخطوة 5 (بعد تنصيب التطبيق)
+    return True
+
+
+def step_4_install_app():
+    """الخطوة 4: تنصيب تطبيق عين العراق"""
+    global PACKAGE_NAME
+
+    print(f"\n{B}{'=' * 55}{RESET}")
+    print(f"{B}  الخطوة 4: تنصيب تطبيق عين العراق{RESET}")
+    print(f"{B}{'=' * 55}{RESET}\n")
+
+    # عرض التطبيقات المنصبة عشان المستخدم يلاقي اسم الحزمة
+    print(f"{C}[*] جاري جلب قائمة التطبيقات المنصبة...{RESET}")
+    result = adb_cmd("shell", "pm", "list", "packages", "-3")  # -3 = third party only
+    installed_packages = []
+    if result and result.returncode == 0 and result.stdout.strip():
+        lines = result.stdout.strip().split('\n')
+        installed_packages = [l.replace('package:', '').strip() for l in lines if l.strip()]
+        print(f"{G}[+] التطبيقات المنصبة ({len(installed_packages)}):{RESET}")
+        for pkg in installed_packages:
+            marker = " ← عين العراق" if "ayniq" in pkg.lower() or "moi" in pkg.lower() else ""
+            print(f"{C}    • {pkg}{G}{marker}{RESET}")
+    else:
+        print(f"{Y}[!] ما قدرت أجلب قائمة التطبيقات{RESET}")
+
+    # التحقق هل التطبيق موجود
+    result = adb_cmd("shell", "pm", "list", "packages", PACKAGE_NAME)
+    if result and PACKAGE_NAME in result.stdout:
+        print(f"\n{G}[+] تطبيق عين العراق ({PACKAGE_NAME}) موجود!{RESET}")
+        return True
+
+    # التطبيق مش موجود — يمكن باسم ثاني؟
+    ayniq_matches = [p for p in installed_packages if "ayniq" in p.lower() or "moi" in p.lower()]
+    if ayniq_matches:
+        print(f"\n{Y}[!] التطبيق مش موجود بالاسم {PACKAGE_NAME}{RESET}")
+        print(f"{G}[+] بس لقيت تطبيقات مشابهة:{RESET}")
+        for i, pkg in enumerate(ayniq_matches, 1):
+            print(f"{C}    {i}. {pkg}{RESET}")
+        choice = input(f"{Y}اختر رقم التطبيق (أو Enter لتخطي): {RESET}").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(ayniq_matches):
+            PACKAGE_NAME = ayniq_matches[int(choice) - 1]
+            print(f"{G}[+] تم تغيير اسم الحزمة إلى: {PACKAGE_NAME}{RESET}")
+            return True
+
+    print(f"\n{Y}[!] التطبيق ({PACKAGE_NAME}) مش منصب{RESET}")
+    print(f"""
+{Y}الخيارات:{RESET}
+{C}  1. نزّل التطبيق من Google Play مباشرة على الجهاز السحابي{RESET}
+{C}     (إذا الجهاز يدعم Google Play){RESET}
+{C}  2. إذا عندك ملف APK:{RESET}
+{C}     adb {'-s ' + DEVICE_SERIAL + ' ' if DEVICE_SERIAL else ''}install path/to/ayniq.apk{RESET}
+{C}  3. نزّل الـ APK من:{RESET}
+{C}     - https://apkpure.com (ابحث عن عين العراق){RESET}
+{C}     - https://apkmirror.com{RESET}
+{C}  4. إذا التطبيق باسم حزمة ثاني — أدخله يدوياً{RESET}
+""")
+
+    user_input = input(f"{Y}أدخل مسار APK / اسم حزمة / Enter لتخطي: {RESET}").strip()
+    if user_input:
+        user_input = user_input.strip('"').strip("'")
+        # هل هو اسم حزمة؟
+        if '.' in user_input and not os.path.exists(user_input) and '/' not in user_input and '\\' not in user_input:
+            PACKAGE_NAME = user_input
+            print(f"{G}[+] تم تغيير اسم الحزمة إلى: {PACKAGE_NAME}{RESET}")
+            # تحقق
+            result = adb_cmd("shell", "pm", "list", "packages", PACKAGE_NAME)
+            if result and PACKAGE_NAME in result.stdout:
+                print(f"{G}[+] التطبيق موجود!{RESET}")
+                return True
+            else:
+                print(f"{Y}[!] الحزمة غير موجودة — بنكمل على أمل إنك تنصبها{RESET}")
+                return True  # نكمل عشان يقدر ينصب من Google Play
+        # هل هو ملف APK؟
+        elif os.path.exists(user_input):
+            print(f"{C}[*] جاري تنصيب التطبيق...{RESET}")
+            ensure_adb_connected()
+            result = adb_cmd("install", user_input, timeout=120)
+            if result and result.returncode == 0:
+                print(f"{G}[+] تم تنصيب التطبيق بنجاح!{RESET}")
+                return True
+            else:
+                print(f"{R}[-] فشل التنصيب{RESET}")
+                if result:
+                    print(f"{R}    {result.stderr}{RESET}")
+                return False
+        else:
+            print(f"{R}[-] الملف غير موجود: {user_input}{RESET}")
+            return False
+    else:
+        # تخطي — التحقق مرة أخيرة
+        result = adb_cmd("shell", "pm", "list", "packages", PACKAGE_NAME)
+        if result and PACKAGE_NAME in result.stdout:
+            print(f"{G}[+] تطبيق عين العراق موجود الآن!{RESET}")
+            return True
+
+        print(f"{Y}[!] التطبيق مش منصب بعد{RESET}")
+        print(f"{Y}    نصبه من Google Play أو بملف APK ثم اضغط Enter{RESET}")
+        input(f"{Y}اضغط Enter بعد التنصيب... {RESET}")
+
+        result = adb_cmd("shell", "pm", "list", "packages", PACKAGE_NAME)
+        if result and PACKAGE_NAME in result.stdout:
+            print(f"{G}[+] تطبيق عين العراق موجود!{RESET}")
+            return True
+        print(f"{R}[-] التطبيق مازال غير موجود{RESET}")
+        return False
+
+
+def step_5_install_frida_server():
+    """الخطوة 5: تنصيب Frida Server على الجهاز"""
+    print(f"\n{B}{'=' * 55}{RESET}")
+    print(f"{B}  الخطوة 5: تنصيب Frida Server على الجهاز{RESET}")
+    print(f"{B}{'=' * 55}{RESET}\n")
+
+    # التحقق هل Frida Server شغال
+    result = adb_su("ps | grep frida-server")
+    if result and "frida-server" in result.stdout and "grep" not in result.stdout.strip().split('\n')[-1]:
+        print(f"{G}[+] Frida Server شغال مسبقاً!{RESET}")
+        # تأكد إنو Frida يقدر يتصل فيه
+        frida_check = ["frida-ps"]
+        if DEVICE_SERIAL:
+            frida_check.extend(["-D", DEVICE_SERIAL])
+        else:
+            frida_check.append("-U")
+        check = run_cmd(frida_check, timeout=15)
+        if check and check.returncode == 0 and "PID" in check.stdout:
+            print(f"{G}[+] Frida متصل بالجهاز!{RESET}")
+            return True
+        print(f"{Y}[!] Frida Server شغال لكن الاتصال فشل — بنعيد تشغيله{RESET}")
+        adb_su("pkill -f frida-server")
+        time.sleep(1)
+
+    # التحقق هل frida-server موجود على الجهاز (ممكن المستخدم نقله يدوياً)
+    result = adb_su("stat -c %s /data/local/tmp/frida-server 2>/dev/null || wc -c < /data/local/tmp/frida-server 2>/dev/null", timeout=15)
+    frida_on_device = False
+    if result and result.returncode == 0 and result.stdout.strip():
+        try:
+            remote_size = int(result.stdout.strip().split()[0])
+            if remote_size > 1_000_000:
+                print(f"{G}[+] frida-server موجود على الجهاز ({remote_size / 1024 / 1024:.1f} MB){RESET}")
+                frida_on_device = True
+        except (ValueError, IndexError):
+            pass
+    # فحص بديل بدون su
+    if not frida_on_device:
+        result = adb_cmd("shell", "ls -la /data/local/tmp/frida-server", timeout=15)
+        if result and result.returncode == 0 and "frida-server" in result.stdout and "No such" not in result.stdout:
+            print(f"{G}[+] frida-server موجود على الجهاز{RESET}")
+            frida_on_device = True
+
+    if frida_on_device:
+        if not _start_frida_server():
+            print(f"{Y}[!] frida-server موجود بس ما اشتغل — بنحاول ننزل نسخة جديدة{RESET}")
+        else:
+            return True
+
+    # معرفة معمارية الجهاز
+    result = adb_cmd("shell", "getprop", "ro.product.cpu.abi")
+    arch = result.stdout.strip() if result else ""
+
+    # إذا فشل الاستعلام الأول، جرب طرق بديلة
+    if not arch:
+        result = adb_cmd("shell", "getprop", "ro.product.cpu.abilist")
+        if result and result.stdout.strip():
+            # يرجع قائمة مثل "arm64-v8a,armeabi-v7a,armeabi" — ناخذ الأول
+            arch = result.stdout.strip().split(',')[0]
+
+    if not arch:
+        result = adb_cmd("shell", "uname", "-m")
+        if result and result.stdout.strip():
+            uname_arch = result.stdout.strip()
+            uname_map = {
+                "aarch64": "arm64-v8a",
+                "armv7l": "armeabi-v7a",
+                "x86_64": "x86_64",
+                "i686": "x86",
+                "i386": "x86",
+            }
+            arch = uname_map.get(uname_arch, uname_arch)
+
+    if not arch:
+        print(f"{Y}[!] ما قدرت أكتشف المعمارية تلقائياً{RESET}")
+        print(f"{Y}    اختر المعمارية:{RESET}")
+        print(f"{C}    1. arm64  (معظم أجهزة Genymotion الحديثة){RESET}")
+        print(f"{C}    2. x86_64{RESET}")
+        print(f"{C}    3. x86{RESET}")
+        print(f"{C}    4. arm{RESET}")
+        arch_choice = input(f"{Y}اختيارك (1-4): {RESET}").strip()
+        arch_fallback = {"1": "arm64-v8a", "2": "x86_64", "3": "x86", "4": "armeabi-v7a"}
+        arch = arch_fallback.get(arch_choice, "arm64-v8a")
+
+    print(f"{C}[*] معمارية الجهاز: {arch}{RESET}")
+
+    # تحديد اسم الملف
+    arch_map = {
+        "x86_64": "x86_64",
+        "x86": "x86",
+        "arm64-v8a": "arm64",
+        "armeabi-v7a": "arm",
+    }
+    frida_arch = arch_map.get(arch, arch)
+
+    # التحقق هل الملف موجود محلياً
+    frida_filename = f"frida-server-{FRIDA_VERSION}-android-{frida_arch}"
+    frida_xz = f"{frida_filename}.xz"
+    frida_local = os.path.join(tempfile.gettempdir(), frida_filename)
+
+    # البحث عن الملف في مجلدات معروفة (Downloads, Desktop, Temp, مجلد السكربت)
+    def _find_frida_file(filename, xz_name):
+        """يبحث عن ملف frida-server في المجلدات الشائعة"""
+        search_dirs = [tempfile.gettempdir()]
+        if sys.platform == "win32":
+            home = os.path.expanduser("~")
+            search_dirs.extend([
+                os.path.join(home, "Downloads"),
+                os.path.join(home, "Desktop"),
+                home,
+                os.path.dirname(os.path.abspath(__file__)),
+                os.getcwd(),
+            ])
+        else:
+            search_dirs.extend([
+                os.path.expanduser("~/Downloads"),
+                os.path.dirname(os.path.abspath(__file__)),
+                os.getcwd(),
+            ])
+
+        for d in search_dirs:
+            if not os.path.isdir(d):
+                continue
+            # أولاً نبحث عن الملف المفكوك
+            candidate = os.path.join(d, filename)
+            if os.path.exists(candidate) and os.path.getsize(candidate) > 1_000_000:
+                return candidate
+            # ثم نبحث عن الملف المضغوط
+            candidate_xz = os.path.join(d, xz_name)
+            if os.path.exists(candidate_xz):
+                return candidate_xz
+        return None
+
+    if not os.path.exists(frida_local):
+        # أولاً: نبحث في المجلدات المعروفة (Downloads, Desktop, ...)
+        found = _find_frida_file(frida_filename, frida_xz)
+        if found:
+            print(f"{G}[+] لقيت الملف تلقائياً: {found}{RESET}")
+            if found.endswith('.xz'):
+                print(f"{C}[*] جاري فك الضغط...{RESET}")
+                try:
+                    import lzma
+                    with lzma.open(found) as f_in:
+                        with open(frida_local, 'wb') as f_out:
+                            f_out.write(f_in.read())
+                    print(f"{G}[+] تم فك الضغط!{RESET}")
+                except Exception as ex:
+                    print(f"{Y}[!] فشل فك الضغط التلقائي: {ex}{RESET}")
+                    found = None
+            else:
+                frida_local = found
+
+    if not os.path.exists(frida_local):
+        # تنزيل frida-server
+        download_url = f"https://github.com/frida/frida/releases/download/{FRIDA_VERSION}/{frida_xz}"
+        print(f"{C}[*] جاري تنزيل Frida Server...{RESET}")
+        print(f"{C}    {download_url}{RESET}")
+
+        downloaded = False
+
+        # الطريقة 1: Python urllib
+        try:
+            import urllib.request
+            xz_path = os.path.join(tempfile.gettempdir(), frida_xz)
+            urllib.request.urlretrieve(download_url, xz_path)
+            print(f"{G}[+] تم التنزيل!{RESET}")
+            downloaded = True
+        except Exception as e:
+            print(f"{Y}[!] فشل التنزيل بـ Python: {e}{RESET}")
+
+        # الطريقة 2: PowerShell (على Windows)
+        if not downloaded and sys.platform == "win32":
+            print(f"{C}[*] جاري المحاولة بـ PowerShell...{RESET}")
+            xz_path = os.path.join(tempfile.gettempdir(), frida_xz)
+            ps_cmd = (
+                f'powershell -Command "'
+                f"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; "
+                f"Invoke-WebRequest -Uri '{download_url}' -OutFile '{xz_path}'"
+                f'"'
+            )
+            try:
+                ps_result = subprocess.run(ps_cmd, shell=True, capture_output=True, text=True, timeout=120)
+                if ps_result.returncode == 0 and os.path.exists(xz_path) and os.path.getsize(xz_path) > 100_000:
+                    print(f"{G}[+] تم التنزيل بـ PowerShell!{RESET}")
+                    downloaded = True
+                else:
+                    err = (ps_result.stderr or "").strip()
+                    print(f"{Y}[!] فشل PowerShell: {err[:200]}{RESET}")
+            except Exception as e2:
+                print(f"{Y}[!] فشل PowerShell: {e2}{RESET}")
+
+        # الطريقة 3: curl (متوفر على Windows 10+ و Linux)
+        if not downloaded:
+            print(f"{C}[*] جاري المحاولة بـ curl...{RESET}")
+            xz_path = os.path.join(tempfile.gettempdir(), frida_xz)
+            try:
+                curl_result = subprocess.run(
+                    ["curl", "-L", "-o", xz_path, download_url],
+                    capture_output=True, text=True, timeout=120
+                )
+                if curl_result.returncode == 0 and os.path.exists(xz_path) and os.path.getsize(xz_path) > 100_000:
+                    print(f"{G}[+] تم التنزيل بـ curl!{RESET}")
+                    downloaded = True
+                else:
+                    print(f"{Y}[!] فشل curl{RESET}")
+            except Exception as e3:
+                print(f"{Y}[!] curl غير متوفر: {e3}{RESET}")
+
+        if downloaded:
+            # فك الضغط
+            xz_path = os.path.join(tempfile.gettempdir(), frida_xz)
+            print(f"{C}[*] جاري فك الضغط...{RESET}")
+            try:
+                if sys.platform == "win32":
+                    import lzma
+                    with lzma.open(xz_path) as f_in:
+                        with open(frida_local, 'wb') as f_out:
+                            f_out.write(f_in.read())
+                else:
+                    subprocess.run(["unxz", "-k", xz_path], check=True)
+                    unxz_path = xz_path.replace(".xz", "")
+                    if os.path.exists(unxz_path) and unxz_path != frida_local:
+                        shutil.move(unxz_path, frida_local)
+                print(f"{G}[+] تم فك الضغط!{RESET}")
+            except Exception as e:
+                print(f"{R}[-] فشل فك الضغط: {e}{RESET}")
+                downloaded = False
+
+        if not downloaded or not os.path.exists(frida_local):
+            print(f"")
+            print(f"{Y}    === التنزيل التلقائي فشل ==={RESET}")
+            print(f"{C}    بنبحث عن الملف تلقائياً بمجلد Downloads...{RESET}")
+
+            # بحث ثاني بعد ما المستخدم ممكن نزّله بالمتصفح
+            found = _find_frida_file(frida_filename, frida_xz)
+            if found:
+                print(f"{G}[+] لقيناه! {found}{RESET}")
+                if found.endswith('.xz'):
+                    print(f"{C}[*] جاري فك الضغط...{RESET}")
+                    try:
+                        import lzma
+                        with lzma.open(found) as f_in:
+                            with open(frida_local, 'wb') as f_out:
+                                f_out.write(f_in.read())
+                        print(f"{G}[+] تم فك الضغط!{RESET}")
+                    except Exception as ex:
+                        print(f"{R}[-] فشل فك الضغط: {ex}{RESET}")
+                        found = None
+                else:
+                    frida_local = found
+
+            if not found or not os.path.exists(frida_local):
+                print(f"")
+                print(f"{Y}    === تعليمات التنزيل اليدوي ==={RESET}")
+                print(f"{C}    1. افتح هذا الرابط بالمتصفح:{RESET}")
+                print(f"{B}       {download_url}{RESET}")
+                print(f"{C}    2. بعد التنزيل، الملف بينحفظ بمجلد Downloads{RESET}")
+                print(f"{C}    3. اضغط Enter — السكربت بيلاقيه تلقائياً{RESET}")
+                print(f"{C}    أو: الصق مسار الملف يدوياً{RESET}")
+                print(f"")
+                manual = input(f"{Y}اضغط Enter (بحث تلقائي) أو الصق المسار: {RESET}").strip()
+
+                if manual:
+                    manual = manual.strip('"').strip("'")
+                    if not os.path.exists(manual):
+                        print(f"{R}[-] الملف غير موجود: {manual}{RESET}")
+                        return False
+                    if manual.endswith('.xz'):
+                        print(f"{C}[*] جاري فك الضغط...{RESET}")
+                        try:
+                            import lzma
+                            with lzma.open(manual) as f_in:
+                                with open(frida_local, 'wb') as f_out:
+                                    f_out.write(f_in.read())
+                            print(f"{G}[+] تم فك الضغط!{RESET}")
+                        except Exception as ex:
+                            print(f"{R}[-] فشل فك الضغط: {ex}{RESET}")
+                            return False
+                    else:
+                        frida_local = manual
+                else:
+                    # بحث تلقائي بعد ما المستخدم نزّل الملف
+                    found = _find_frida_file(frida_filename, frida_xz)
+                    if found:
+                        print(f"{G}[+] لقيناه! {found}{RESET}")
+                        if found.endswith('.xz'):
+                            print(f"{C}[*] جاري فك الضغط...{RESET}")
+                            try:
+                                import lzma
+                                with lzma.open(found) as f_in:
+                                    with open(frida_local, 'wb') as f_out:
+                                        f_out.write(f_in.read())
+                                print(f"{G}[+] تم فك الضغط!{RESET}")
+                            except Exception as ex:
+                                print(f"{R}[-] فشل فك الضغط: {ex}{RESET}")
+                                return False
+                        else:
+                            frida_local = found
+                    else:
+                        print(f"{R}[-] ما لقيت الملف — جرّب تنزله وشغّل السكربت مرة ثانية{RESET}")
+                        return False
+
+    # التحقق من حجم الملف (frida-server عادة > 10MB)
+    file_size = os.path.getsize(frida_local)
+    if file_size < 1_000_000:  # أقل من 1MB — غالباً ملف خطأ
+        print(f"{R}[-] حجم الملف صغير جداً ({file_size} bytes) — غالباً مش ملف frida-server الصحيح{RESET}")
+        print(f"{Y}    الملف الصحيح حجمه أكبر من 10MB بعد فك الضغط{RESET}")
+        return False
+
+    print(f"{G}[+] حجم الملف: {file_size / 1024 / 1024:.1f} MB — يبدو صحيح{RESET}")
+
+    # إعادة اتصال ADB (قد ينقطع أثناء التنزيل اليدوي)
+    if not ensure_adb_connected():
+        print(f"{R}[-] ADB غير متصل — ما نقدر نكمل{RESET}")
+        return False
+
+    # === الأولوية 1: تنزيل مباشر على الجهاز (أسرع وأضمن من adb push) ===
+    download_url = f"https://github.com/frida/frida/releases/download/{FRIDA_VERSION}/{frida_xz}"
+    print(f"{C}[*] جاري تنزيل Frida Server مباشرة على الجهاز السحابي...{RESET}")
+
+    device_downloaded = False
+    # جرب wget أولاً
+    dl_result = adb_su(
+        f"wget -q -O /data/local/tmp/frida-server.xz '{download_url}' 2>&1",
+        timeout=120
+    )
+    if dl_result and dl_result.returncode == 0:
+        # فك الضغط على الجهاز
+        print(f"{C}[*] جاري فك الضغط على الجهاز...{RESET}")
+        adb_su("xz -d -f /data/local/tmp/frida-server.xz 2>/dev/null || unxz -f /data/local/tmp/frida-server.xz 2>/dev/null", timeout=60)
+        # تحقق من الملف
+        sz = adb_su("stat -c %s /data/local/tmp/frida-server 2>/dev/null", timeout=10)
+        if sz and sz.stdout.strip().isdigit() and int(sz.stdout.strip()) > 1_000_000:
+            print(f"{G}[+] تم التنزيل وفك الضغط على الجهاز مباشرة!{RESET}")
+            device_downloaded = True
+
+    # جرب curl إذا wget فشل
+    if not device_downloaded:
+        dl_result = adb_su(
+            f"curl -sL -o /data/local/tmp/frida-server.xz '{download_url}' 2>&1",
+            timeout=120
+        )
+        if dl_result and dl_result.returncode == 0:
+            print(f"{C}[*] جاري فك الضغط على الجهاز...{RESET}")
+            adb_su("xz -d -f /data/local/tmp/frida-server.xz 2>/dev/null || unxz -f /data/local/tmp/frida-server.xz 2>/dev/null", timeout=60)
+            sz = adb_su("stat -c %s /data/local/tmp/frida-server 2>/dev/null", timeout=10)
+            if sz and sz.stdout.strip().isdigit() and int(sz.stdout.strip()) > 1_000_000:
+                print(f"{G}[+] تم التنزيل وفك الضغط على الجهاز مباشرة!{RESET}")
+                device_downloaded = True
+
+    if not device_downloaded:
+        print(f"{Y}[!] التنزيل المباشر على الجهاز فشل — بنجرب adb push...{RESET}")
+
+    # === الأولوية 2: adb push من الكمبيوتر المحلي ===
+    if not device_downloaded:
+        # إيقاف أي frida-server قديم
+        adb_su("pkill -f frida-server 2>/dev/null")
+        time.sleep(1)
+
+        print(f"{C}[*] جاري دفع Frida Server للجهاز ({DEVICE_SERIAL})...{RESET}")
+        result = adb_cmd("push", frida_local, "/data/local/tmp/frida-server", timeout=300)
+        if not result or result.returncode != 0:
+            err_msg = ""
+            if result:
+                err_msg = (result.stderr or "").strip() or (result.stdout or "").strip()
+            print(f"{Y}[!] فشل adb push: {err_msg}{RESET}")
+
+            # محاولة إعادة اتصال ثم إعادة المحاولة
+            print(f"{C}[*] جاري إعادة اتصال ADB ومحاولة ثانية...{RESET}")
+            if ensure_adb_connected():
+                result = adb_cmd("push", frida_local, "/data/local/tmp/frida-server", timeout=300)
+                if result and result.returncode == 0:
+                    print(f"{G}[+] تم دفع الملف بعد إعادة الاتصال!{RESET}")
+                else:
+                    # === الأولوية 3: base64 streaming ===
+                    print(f"{Y}[!] adb push فشل — بنجرب طريقة base64...{RESET}")
+                    try:
+                        import base64
+                        with open(frida_local, 'rb') as f:
+                            data = f.read()
+                        # نرسل الملف بأجزاء صغيرة عبر echo + base64
+                        chunk_size = 48000  # ~64KB per base64 chunk
+                        adb_su("rm -f /data/local/tmp/frida-server", timeout=10)
+                        total_chunks = (len(data) + chunk_size - 1) // chunk_size
+                        for i in range(0, len(data), chunk_size):
+                            chunk = base64.b64encode(data[i:i+chunk_size]).decode()
+                            op = ">>" if i > 0 else ">"
+                            chunk_num = i // chunk_size + 1
+                            print(f"\r{C}[*] إرسال الجزء {chunk_num}/{total_chunks}...{RESET}", end="", flush=True)
+                            adb_su(f"echo {chunk} | base64 -d {op} /data/local/tmp/frida-server", timeout=30)
+                        print(f"\n{G}[+] تم إرسال الملف بطريقة base64!{RESET}")
+                    except Exception as b64_err:
+                        print(f"{R}[-] فشلت كل طرق نقل الملف: {b64_err}{RESET}")
+                        print(f"{Y}    انقل الملف يدوياً عبر واجهة Genymotion Cloud{RESET}")
+                        print(f"{Y}    أو شغّل frida-server يدوياً على الجهاز{RESET}")
+                        return False
+            else:
+                print(f"{R}[-] ADB غير متصل{RESET}")
+                return False
+        else:
+            print(f"{G}[+] تم دفع الملف!{RESET}")
+
+    # تشغيل Frida Server
+    if not _start_frida_server():
+        # فشل — نعطي تعليمات يدوية
+        serial_flag = f"-s {DEVICE_SERIAL} " if DEVICE_SERIAL else ""
+        print(f"{R}[-] Frida Server لم يشتغل!{RESET}")
+        print(f"{Y}    جرب يدوياً:{RESET}")
+        print(f"{C}    1. adb {serial_flag}shell \"su -c 'setenforce 0'\"{RESET}")
+        print(f"{C}    2. adb {serial_flag}shell \"su -c '/data/local/tmp/frida-server -D &'\"{RESET}")
+        print(f"{C}    3. frida-ps {'-D ' + DEVICE_SERIAL if DEVICE_SERIAL else '-U'}{RESET}")
+        print(f"{Y}    إذا الأمر الثالث طبع قائمة عمليات، يعني شغال{RESET}")
+
+        retry = input(f"{Y}هل شغّلته يدوياً وتريد الاستمرار؟ (y/n): {RESET}").strip().lower()
+        if retry == 'y':
+            frida_test_cmd = ["frida-ps"]
+            if DEVICE_SERIAL:
+                frida_test_cmd.extend(["-D", DEVICE_SERIAL])
+            else:
+                frida_test_cmd.append("-U")
+            test_result = run_cmd(frida_test_cmd, timeout=15)
+            if test_result and test_result.returncode == 0:
+                print(f"{G}[+] Frida متصل بنجاح!{RESET}")
+                return True
+            else:
+                print(f"{R}[-] مازال غير متصل{RESET}")
+                return False
+        return False
+    return True
+
+
+def step_5b_patch_apk_gadget():
+    """الخطوة 5b: حقن Frida Gadget بالتطبيق (بدون root)"""
+    global GADGET_MODE
+    import zipfile
+
+    print(f"\n{B}{'=' * 55}{RESET}")
+    print(f"{B}  الخطوة 5b: حقن Frida Gadget (بدون root){RESET}")
+    print(f"{B}{'=' * 55}{RESET}\n")
+
+    print(f"{C}[*] الجهاز مش مروّت — سنحقن Frida Gadget داخل التطبيق{RESET}")
+    print(f"{C}[*] هذا يحمّل التجاوز قبل أي كود أمان بالتطبيق!{RESET}\n")
+
+    work_dir = os.path.join(TOOLS_DIR, "_gadget_work")
+    os.makedirs(work_dir, exist_ok=True)
+
+    # === 1. تنصيب lief ===
+    print(f"{C}[*] تنصيب مكتبة LIEF لحقن المكتبات...{RESET}")
+    run_cmd([sys.executable, "-m", "pip", "install", "lief", "-q"], timeout=120)
+    try:
+        import lief
+        print(f"{G}[+] LIEF جاهز{RESET}")
+    except ImportError:
+        print(f"{R}[-] فشل تنصيب LIEF — جرب يدوياً: pip install lief{RESET}")
+        return False
+
+    # === 2. سحب APK من الجهاز ===
+    print(f"\n{C}[*] جاري البحث عن APK على الجهاز...{RESET}")
+    result = adb_cmd("shell", f"pm path {PACKAGE_NAME}", timeout=15)
+    if not result or not result.stdout.strip():
+        print(f"{R}[-] ما لقينا APK لـ {PACKAGE_NAME}{RESET}")
+        return False
+
+    apk_paths = []
+    for line in result.stdout.strip().split('\n'):
+        path = line.strip().replace("package:", "")
+        if path:
+            apk_paths.append(path)
+
+    print(f"{C}[*] لقينا {len(apk_paths)} ملف APK:{RESET}")
+    for p in apk_paths:
+        print(f"    {p}")
+
+    # سحب كل ملفات APK
+    local_apks = []
+    for i, remote_path in enumerate(apk_paths):
+        fname = os.path.basename(remote_path)
+        local_path = os.path.join(work_dir, f"original_{fname}")
+        print(f"{C}[*] سحب {fname}...{RESET}")
+        pull_result = adb_cmd("pull", remote_path, local_path, timeout=180)
+        if pull_result and pull_result.returncode == 0 and os.path.exists(local_path):
+            size_mb = os.path.getsize(local_path) / 1024 / 1024
+            print(f"{G}[+] {fname}: {size_mb:.1f} MB{RESET}")
+            local_apks.append((remote_path, local_path, fname))
+        else:
+            print(f"{Y}[!] فشل سحب {fname}{RESET}")
+
+    if not local_apks:
+        print(f"{R}[-] ما قدرنا نسحب أي APK{RESET}")
+        return False
+
+    # === 3. فك ضغط الـ base APK وتحليله ===
+    base_apk_path = local_apks[0][1]
+    extract_dir = os.path.join(work_dir, "extracted")
+    if os.path.exists(extract_dir):
+        shutil.rmtree(extract_dir)
+
+    print(f"\n{C}[*] فك ضغط APK...{RESET}")
+    with zipfile.ZipFile(base_apk_path) as z:
+        z.extractall(extract_dir)
+
+    # === 4. كشف المعمارية والمكتبات ===
+    arch = None
+    lib_dir = None
+    for arch_name in ["arm64-v8a", "armeabi-v7a", "x86_64", "x86"]:
+        candidate = os.path.join(extract_dir, "lib", arch_name)
+        if os.path.exists(candidate):
+            arch = arch_name
+            lib_dir = candidate
+            break
+
+    if not lib_dir:
+        print(f"{R}[-] ما لقينا مكتبات native بالـ APK{RESET}")
+        print(f"{Y}    التطبيق ممكن Java/Kotlin فقط — نحتاج طريقة ثانية{RESET}")
+        return False
+
+    so_files = [f for f in os.listdir(lib_dir) if f.endswith('.so')]
+    print(f"{G}[+] المعمارية: {arch}{RESET}")
+    print(f"{C}[*] المكتبات الموجودة ({len(so_files)}):{RESET}")
+    for so in so_files[:10]:
+        size = os.path.getsize(os.path.join(lib_dir, so)) / 1024
+        print(f"    {so} ({size:.0f} KB)")
+
+    # اختيار المكتبة للحقن
+    target_so = None
+    priority = ["libflutter.so", "libapp.so", "libmain.so", "libreactnativejni.so",
+                 "libmonodroid.so", "libunity.so", "libil2cpp.so"]
+    for p in priority:
+        if p in so_files:
+            target_so = p
+            break
+    if not target_so and so_files:
+        target_so = so_files[0]
+
+    if not target_so:
+        print(f"{R}[-] ما لقينا مكتبة .so لحقنها{RESET}")
+        return False
+
+    print(f"{G}[+] سنحقن Gadget عبر: {target_so}{RESET}")
+
+    # === 5. تنزيل Frida Gadget ===
+    gadget_arch_map = {
+        "arm64-v8a": "android-arm64",
+        "armeabi-v7a": "android-arm",
+        "x86_64": "android-x86_64",
+        "x86": "android-x86",
+    }
+    gadget_arch = gadget_arch_map.get(arch, "android-arm64")
+    gadget_so = os.path.join(work_dir, f"frida-gadget-{gadget_arch}.so")
+
+    if not os.path.exists(gadget_so) or os.path.getsize(gadget_so) < 1_000_000:
+        url = f"https://github.com/frida/frida/releases/download/{FRIDA_VERSION}/frida-gadget-{FRIDA_VERSION}-{gadget_arch}.so.xz"
+        print(f"\n{C}[*] تنزيل Frida Gadget ({gadget_arch})...{RESET}")
+        xz_path = gadget_so + ".xz"
+
+        try:
+            import urllib.request
+            urllib.request.urlretrieve(url, xz_path)
+        except Exception as e:
+            print(f"{Y}[!] urllib فشل: {e}{RESET}")
+            # PowerShell fallback
+            dl_cmd = f'powershell -Command "Invoke-WebRequest -Uri \'{url}\' -OutFile \'{xz_path}\'"'
+            run_cmd(dl_cmd.split(), timeout=120)
+
+        if os.path.exists(xz_path):
+            import lzma
+            print(f"{C}[*] فك ضغط .xz...{RESET}")
+            with lzma.open(xz_path) as xz_f:
+                with open(gadget_so, 'wb') as out_f:
+                    out_f.write(xz_f.read())
+            os.remove(xz_path)
+
+    if not os.path.exists(gadget_so) or os.path.getsize(gadget_so) < 1_000_000:
+        print(f"{R}[-] فشل تنزيل Frida Gadget{RESET}")
+        print(f"{Y}    نزّله يدوياً من:{RESET}")
+        print(f"{Y}    https://github.com/frida/frida/releases/tag/{FRIDA_VERSION}{RESET}")
+        return False
+
+    print(f"{G}[+] Frida Gadget: {os.path.getsize(gadget_so) / 1024 / 1024:.1f} MB{RESET}")
+
+    # === 6. حقن dependency بـ LIEF ===
+    target_so_path = os.path.join(lib_dir, target_so)
+    print(f"\n{C}[*] حقن libfrida-gadget.so كـ dependency في {target_so}...{RESET}")
+
+    try:
+        binary = lief.parse(target_so_path)
+        if binary is None:
+            print(f"{R}[-] فشل تحليل {target_so}{RESET}")
+            return False
+        binary.add_library("libfrida-gadget.so")
+        binary.write(target_so_path)
+        print(f"{G}[+] تم حقن dependency بنجاح!{RESET}")
+    except Exception as e:
+        print(f"{R}[-] فشل الحقن: {e}{RESET}")
+        return False
+
+    # === 7. نسخ Gadget .so ===
+    gadget_dest = os.path.join(lib_dir, "libfrida-gadget.so")
+    shutil.copy2(gadget_so, gadget_dest)
+    print(f"{G}[+] تم نسخ libfrida-gadget.so{RESET}")
+
+    # === 8. إنشاء ملف إعدادات Gadget ===
+    # وضع listen — الـ Gadget يفتح بورت وينتظر اتصال Frida
+    config = {
+        "interaction": {
+            "type": "listen",
+            "address": "0.0.0.0",
+            "port": 27042,
+            "on_load": "wait"
+        }
+    }
+    config_path = os.path.join(lib_dir, "libfrida-gadget.config.so")
+    with open(config_path, 'w') as f:
+        json.dump(config, f, indent=2)
+    print(f"{G}[+] إعدادات Gadget: listen mode (port 27042){RESET}")
+
+    # === 9. إعادة تعبئة APK ===
+    print(f"\n{C}[*] إعادة تعبئة APK المعدّل...{RESET}")
+
+    # حذف التوقيع القديم
+    meta_inf = os.path.join(extract_dir, "META-INF")
+    if os.path.exists(meta_inf):
+        shutil.rmtree(meta_inf)
+
+    patched_unsigned = os.path.join(work_dir, "patched_unsigned.apk")
+    with zipfile.ZipFile(patched_unsigned, 'w', zipfile.ZIP_DEFLATED) as zout:
+        for root, dirs, files in os.walk(extract_dir):
+            for file in files:
+                file_path = os.path.join(root, file)
+                arcname = os.path.relpath(file_path, extract_dir)
+                # ملفات .so و .arsc بدون ضغط (alignment)
+                if file.endswith('.so') or file.endswith('.arsc'):
+                    zout.write(file_path, arcname, compress_type=zipfile.ZIP_STORED)
+                else:
+                    zout.write(file_path, arcname, compress_type=zipfile.ZIP_DEFLATED)
+
+    patched_size = os.path.getsize(patched_unsigned) / 1024 / 1024
+    print(f"{G}[+] APK معدّل: {patched_size:.1f} MB{RESET}")
+
+    # === 10. محاذاة (zipalign) ===
+    patched_aligned = os.path.join(work_dir, "patched_aligned.apk")
+    patched_final = os.path.join(work_dir, "patched.apk")
+
+    # البحث عن zipalign و apksigner من Android SDK
+    sdk_path = os.environ.get("ANDROID_HOME") or os.environ.get("ANDROID_SDK_ROOT")
+    if not sdk_path:
+        for p in [
+            os.path.expanduser("~/AppData/Local/Android/Sdk"),
+            "C:\\Users\\jefo\\AppData\\Local\\Android\\Sdk",
+            os.path.expanduser("~/Android/Sdk"),
+            "/usr/lib/android-sdk",
+        ]:
+            if os.path.exists(p):
+                sdk_path = p
+                break
+
+    zipalign_exe = None
+    apksigner_exe = None
+    if sdk_path:
+        bt_dir = os.path.join(sdk_path, "build-tools")
+        if os.path.exists(bt_dir):
+            versions = sorted(os.listdir(bt_dir), reverse=True)
+            for v in versions:
+                za = os.path.join(bt_dir, v, "zipalign")
+                if sys.platform == "win32":
+                    za += ".exe"
+                if os.path.exists(za):
+                    zipalign_exe = za
+                    break
+            for v in versions:
+                sig = os.path.join(bt_dir, v, "apksigner")
+                if sys.platform == "win32":
+                    sig += ".bat"
+                if os.path.exists(sig):
+                    apksigner_exe = sig
+                    break
+
+    if zipalign_exe:
+        print(f"{C}[*] محاذاة APK بـ zipalign...{RESET}")
+        run_cmd([zipalign_exe, "-f", "-p", "4", patched_unsigned, patched_aligned], timeout=60)
+        if not os.path.exists(patched_aligned):
+            # fallback بدون -p
+            run_cmd([zipalign_exe, "-f", "4", patched_unsigned, patched_aligned], timeout=60)
+    else:
+        print(f"{Y}[!] zipalign غير موجود — نتجاوز المحاذاة{RESET}")
+        shutil.copy2(patched_unsigned, patched_aligned)
+
+    # === 11. توقيع APK ===
+    print(f"{C}[*] توقيع APK...{RESET}")
+    keystore = os.path.join(work_dir, "debug.keystore")
+
+    # إنشاء keystore للتوقيع إذا مش موجود
+    if not os.path.exists(keystore):
+        keytool_cmd = [
+            "keytool", "-genkey", "-v",
+            "-keystore", keystore,
+            "-alias", "debug",
+            "-keyalg", "RSA", "-keysize", "2048",
+            "-validity", "10000",
+            "-storepass", "android", "-keypass", "android",
+            "-dname", "CN=Gadget,O=Frida,L=Debug"
+        ]
+        kt_result = run_cmd(keytool_cmd, timeout=30)
+        if not kt_result or kt_result.returncode != 0:
+            print(f"{Y}[!] keytool فشل — بنجرب jarsigner بدون keystore{RESET}")
+
+    signed = False
+    if apksigner_exe and os.path.exists(keystore):
+        shutil.copy2(patched_aligned, patched_final)
+        sign_result = run_cmd([
+            apksigner_exe, "sign",
+            "--ks", keystore,
+            "--ks-pass", "pass:android",
+            "--key-pass", "pass:android",
+            patched_final
+        ], timeout=60)
+        if sign_result and sign_result.returncode == 0:
+            print(f"{G}[+] تم التوقيع بـ apksigner{RESET}")
+            signed = True
+        else:
+            print(f"{Y}[!] apksigner فشل{RESET}")
+
+    if not signed and os.path.exists(keystore):
+        # jarsigner fallback
+        sign_result = run_cmd([
+            "jarsigner", "-verbose",
+            "-sigalg", "SHA256withRSA", "-digestalg", "SHA-256",
+            "-keystore", keystore, "-storepass", "android",
+            patched_aligned, "debug"
+        ], timeout=60)
+        if sign_result and sign_result.returncode == 0:
+            shutil.copy2(patched_aligned, patched_final)
+            print(f"{G}[+] تم التوقيع بـ jarsigner{RESET}")
+            signed = True
+
+    if not signed:
+        # uber-apk-signer fallback — download and use
+        print(f"{Y}[!] ما قدرنا نوقع APK — بنحاول نثبته بدون توقيع{RESET}")
+        shutil.copy2(patched_aligned, patched_final)
+
+    final_size = os.path.getsize(patched_final) / 1024 / 1024
+    print(f"\n{G}[+] APK النهائي: {final_size:.1f} MB{RESET}")
+
+    # === 12. إزالة التطبيق الأصلي وتنصيب المعدّل ===
+    print(f"\n{C}[*] إزالة التطبيق الأصلي...{RESET}")
+    adb_cmd("uninstall", PACKAGE_NAME, timeout=30)
+    time.sleep(2)
+
+    print(f"{C}[*] تنصيب التطبيق المعدّل...{RESET}")
+    install_result = adb_cmd("install", patched_final, timeout=180)
+    if install_result and install_result.returncode == 0:
+        print(f"{G}[+] تم تنصيب التطبيق المعدّل بنجاح!{RESET}")
+        GADGET_MODE = True
+        return True
+    else:
+        err = install_result.stderr if install_result else ""
+        err += install_result.stdout if install_result else ""
+        print(f"{R}[-] فشل التنصيب: {err}{RESET}")
+
+        # إذا فشل بسبب التوقيع — نجرب install مع -r أو --no-verify
+        if "INSTALL_PARSE_FAILED_NO_CERTIFICATES" in err or "signature" in err.lower():
+            print(f"{Y}[!] مشكلة بالتوقيع — بنجرب بدون تحقق...{RESET}")
+            install_result = adb_cmd("install", "-r", "--no-verify", patched_final, timeout=180)
+            if install_result and install_result.returncode == 0:
+                print(f"{G}[+] تم التنصيب!{RESET}")
+                GADGET_MODE = True
+                return True
+
+        # إعادة تنصيب الأصلي
+        print(f"{Y}[!] بنعيد تنصيب التطبيق الأصلي...{RESET}")
+        adb_cmd("install", base_apk_path, timeout=180)
+        return False
+
+
+def _extract_with_gadget(script_path):
+    """سحب التوكن عبر Frida Gadget (بدون root)"""
+    print(f"\n{C}[*] === وضع Frida Gadget ==={RESET}")
+    print(f"{C}[*] التطبيق بيفتح ويوقف تلقائياً لحد ما نربط Frida{RESET}\n")
+
+    # إعداد port forwarding
+    adb_cmd("forward", "tcp:27042", "tcp:27042", timeout=10)
+
+    # فتح التطبيق — Gadget بيوقفه مؤقتاً
+    print(f"{C}[*] جاري فتح التطبيق (Gadget سيوقفه مؤقتاً)...{RESET}")
+    _launch_app()
+
+    # ننتظر Gadget يبدأ ويفتح البورت
+    print(f"{C}[*] ننتظر Gadget يبدأ...{RESET}")
+    time.sleep(5)
+
+    # قراءة سكربت التجاوز
+    script_code = open(script_path, 'r', encoding='utf-8').read()
+
+    try:
+        import frida
+    except ImportError:
+        print(f"{R}[-] frida module مش منصب{RESET}")
+        return False
+
+    token_found = [False]
+
+    def on_message(message, data):
+        if message['type'] == 'send':
+            payload = str(message.get('payload', ''))
+            print(f"{C}{payload}{RESET}")
+            if 'APP CHECK TOKEN' in payload or 'eyJ' in payload:
+                token_found[0] = True
+        elif message['type'] == 'error':
+            print(f"{R}[Frida Error] {message.get('description', '')}{RESET}")
+
+    # محاولة الاتصال بـ Gadget
+    connected = False
+    for attempt in range(5):
+        try:
+            print(f"{C}[*] محاولة اتصال {attempt + 1}/5...{RESET}")
+            mgr = frida.get_device_manager()
+            device = mgr.add_remote_device("127.0.0.1:27042")
+
+            # Gadget يظهر كـ "Gadget" أو باسم الحزمة
+            session = device.attach("Gadget")
+            print(f"{G}[+] متصل بـ Gadget!{RESET}")
+            connected = True
+
+            script = session.create_script(script_code)
+            script.on('message', on_message)
+            script.load()
+            print(f"{G}[+] سكربت التجاوز محمّل!{RESET}")
+
+            # استئناف التطبيق
+            device.resume(device.enumerate_processes()[0].pid)
+            print(f"{G}[+] التطبيق شغال! سوي أي عملية عشان يظهر التوكن{RESET}")
+            print(f"{Y}[*] اضغط Ctrl+C لإيقاف المراقبة{RESET}\n")
+
+            try:
+                while True:
+                    time.sleep(1)
+                    if token_found[0]:
+                        print(f"\n{G}[+] تم رصد التوكن!{RESET}")
+                        break
+            except KeyboardInterrupt:
+                print(f"\n{Y}[*] تم إيقاف المراقبة{RESET}")
+
+            try:
+                script.unload()
+                session.detach()
+            except Exception:
+                pass
+            return token_found[0]
+
+        except frida.ServerNotRunningError:
+            print(f"{Y}[!] Gadget مش جاهز بعد...{RESET}")
+            time.sleep(3)
+        except frida.ProcessNotFoundError:
+            print(f"{Y}[!] عملية Gadget مش موجودة — ممكن التطبيق ما فتح{RESET}")
+            _launch_app()
+            time.sleep(3)
+        except Exception as e:
+            print(f"{Y}[!] خطأ: {e}{RESET}")
+            time.sleep(3)
+
+    if not connected:
+        print(f"{R}[-] ما قدرنا نتصل بـ Gadget بعد 5 محاولات{RESET}")
+        print(f"{Y}    تأكد إن التطبيق فتح وانتظر شوي{RESET}")
+    return False
+
+
+def _find_launcher_activity():
+    """اكتشاف الـ activity الرئيسي للتطبيق"""
+    # الطريقة 1: dumpsys
+    result = adb_cmd("shell", f"dumpsys package {PACKAGE_NAME} | grep -A1 'android.intent.action.MAIN'", timeout=10)
+    if result and result.stdout:
+        for line in result.stdout.split('\n'):
+            line = line.strip()
+            if PACKAGE_NAME in line and '/' in line:
+                # استخراج activity name
+                parts = line.split()
+                for part in parts:
+                    if '/' in part and PACKAGE_NAME in part:
+                        return part.strip()
+    # الطريقة 2: cmd package
+    result = adb_cmd("shell", f"cmd package resolve-activity --brief {PACKAGE_NAME}", timeout=10)
+    if result and result.stdout:
+        for line in result.stdout.strip().split('\n'):
+            if '/' in line and PACKAGE_NAME in line:
+                return line.strip()
+    return None
+
+
+def _launch_app():
+    """فتح التطبيق بكل الطرق الممكنة والتأكد إنه شغال"""
+    print(f"{C}[*] جاري فتح التطبيق...{RESET}")
+
+    # اكتشاف الـ activity الرئيسي
+    launcher = _find_launcher_activity()
+    if launcher:
+        print(f"{C}[*] Activity الرئيسي: {launcher}{RESET}")
+        adb_cmd("shell", f"am start -n {launcher}", timeout=10)
+    else:
+        # طرق بديلة
+        adb_cmd("shell", f"am start -a android.intent.action.MAIN -c android.intent.category.LAUNCHER {PACKAGE_NAME}", timeout=10)
+        adb_cmd("shell", f"monkey -p {PACKAGE_NAME} -c android.intent.category.LAUNCHER 1", timeout=10)
+
+    time.sleep(3)
+
+    # تحقق هل التطبيق شغال
+    result = adb_cmd("shell", f"pidof {PACKAGE_NAME}", timeout=5)
+    if result and result.stdout.strip().isdigit():
+        print(f"{G}[+] التطبيق شغال (PID: {result.stdout.strip()}){RESET}")
+        return True
+
+    # طريقة بديلة للفحص
+    result = adb_cmd("shell", f"ps | grep {PACKAGE_NAME}", timeout=5)
+    if result and PACKAGE_NAME in result.stdout:
+        print(f"{G}[+] التطبيق شغال!{RESET}")
+        return True
+
+    print(f"{Y}[!] التطبيق ممكن ما فتح أو عمل crash{RESET}")
+    return False
+
+
+def _frida_spawn_python(script_path):
+    """استخدام Python frida API لـ spawn — أقوى من CLI"""
+    try:
+        import frida
+    except ImportError:
+        print(f"{Y}[!] frida module مش منصب — بنستخدم CLI{RESET}")
+        return None
+
+    device = None
+    script_code = open(script_path, 'r', encoding='utf-8').read()
+
+    # === الطريقة 1: Port forwarding + remote device ===
+    if DEVICE_SERIAL and "localhost:" in DEVICE_SERIAL:
+        print(f"{C}[*] إعداد port forwarding لـ Frida Python API...{RESET}")
+        fwd_result = adb_cmd("forward", "tcp:27042", "tcp:27042", timeout=10)
+        if fwd_result and fwd_result.returncode == 0:
+            try:
+                mgr = frida.get_device_manager()
+                device = mgr.add_remote_device("127.0.0.1:27042")
+                # تحقق سريع
+                device.enumerate_processes()
+                print(f"{G}[+] متصل عبر TCP (127.0.0.1:27042){RESET}")
+            except Exception as e:
+                print(f"{Y}[!] TCP فشل: {e}{RESET}")
+                device = None
+
+    # === الطريقة 2: -D device by serial ===
+    if not device and DEVICE_SERIAL:
+        try:
+            device = frida.get_device(DEVICE_SERIAL, timeout=10)
+            device.enumerate_processes()
+            print(f"{G}[+] متصل بـ {DEVICE_SERIAL}{RESET}")
+        except Exception as e:
+            print(f"{Y}[!] -D فشل: {e}{RESET}")
+            device = None
+
+    # === الطريقة 3: USB ===
+    if not device:
+        try:
+            device = frida.get_usb_device(timeout=10)
+            device.enumerate_processes()
+            print(f"{G}[+] متصل عبر USB{RESET}")
+        except Exception as e:
+            print(f"{Y}[!] USB فشل: {e}{RESET}")
+            return None
+
+    if not device:
+        return None
+
+    # === محاولة spawn ===
+    token_found = [False]
+    token_value = [None]
+
+    def on_message(message, data):
+        if message['type'] == 'send':
+            payload = str(message.get('payload', ''))
+            print(f"{C}{payload}{RESET}")
+            if 'APP CHECK TOKEN' in payload or 'eyJ' in payload:
+                token_found[0] = True
+                # استخراج التوكن
+                for part in payload.split():
+                    if part.startswith('eyJ'):
+                        token_value[0] = part
+        elif message['type'] == 'error':
+            print(f"{R}[Frida Error] {message.get('description', '')}{RESET}")
+
+    # محاولة 1: spawn
+    print(f"{C}[*] Python Frida API — spawn mode...{RESET}")
+    try:
+        pid = device.spawn([PACKAGE_NAME])
+        print(f"{G}[+] Spawn نجح! PID: {pid}{RESET}")
+        session = device.attach(pid)
+        script = session.create_script(script_code)
+        script.on('message', on_message)
+        script.load()
+        device.resume(pid)
+        print(f"{G}[+] التطبيق شغال مع التجاوز! اضغط Ctrl+C لما يظهر التوكن{RESET}")
+
+        try:
+            while True:
+                time.sleep(1)
+                if token_found[0]:
+                    print(f"\n{G}[+] تم رصد التوكن عبر Python API!{RESET}")
+                    break
+        except KeyboardInterrupt:
+            print(f"\n{Y}[*] تم إيقاف المراقبة{RESET}")
+
+        try:
+            script.unload()
+            session.detach()
+        except Exception:
+            pass
+        return token_found[0]
+
+    except frida.NotSupportedError as e:
+        print(f"{Y}[!] Spawn غير مدعوم: {e}{RESET}")
+    except Exception as e:
+        print(f"{Y}[!] Spawn فشل: {e}{RESET}")
+
+    # محاولة 2: attach (نفتح التطبيق أولاً)
+    print(f"\n{C}[*] Python Frida API — attach mode...{RESET}")
+    _launch_app()
+    time.sleep(2)
+
+    try:
+        # نلاقي الـ PID
+        target_pid = None
+        for proc in device.enumerate_processes():
+            if proc.name == PACKAGE_NAME or PACKAGE_NAME in proc.name:
+                target_pid = proc.pid
+                break
+
+        if not target_pid:
+            # جرب بالاسم المختصر
+            result = adb_cmd("shell", f"pidof {PACKAGE_NAME}", timeout=5)
+            if result and result.stdout.strip().isdigit():
+                target_pid = int(result.stdout.strip())
+
+        if not target_pid:
+            print(f"{R}[-] التطبيق مش شغال — ممكن عمل crash بسبب كشف الروت{RESET}")
+            # نعرض logcat لتشخيص المشكلة
+            print(f"{C}[*] جاري فحص سجل الأخطاء...{RESET}")
+            log = adb_cmd("shell", f"logcat -d -t 30 --pid=$(pidof {PACKAGE_NAME}) 2>/dev/null || logcat -d -t 50 | grep -i '{PACKAGE_NAME}\\|root\\|detect\\|security'", timeout=10)
+            if log and log.stdout.strip():
+                print(f"{Y}--- سجل الأخطاء ---{RESET}")
+                for line in log.stdout.strip().split('\n')[-20:]:
+                    print(f"  {line}")
+                print(f"{Y}--- نهاية السجل ---{RESET}")
+            return None
+
+        print(f"{G}[+] التطبيق شغال — PID: {target_pid}{RESET}")
+        session = device.attach(target_pid)
+        script = session.create_script(script_code)
+        script.on('message', on_message)
+        script.load()
+        print(f"{G}[+] سكربت التجاوز محمّل! سوي عملية بالتطبيق{RESET}")
+        print(f"{Y}[*] اضغط Ctrl+C لإيقاف المراقبة{RESET}")
+
+        try:
+            while True:
+                time.sleep(1)
+                if token_found[0]:
+                    print(f"\n{G}[+] تم رصد التوكن!{RESET}")
+                    break
+        except KeyboardInterrupt:
+            print(f"\n{Y}[*] تم إيقاف المراقبة{RESET}")
+
+        try:
+            script.unload()
+            session.detach()
+        except Exception:
+            pass
+        return token_found[0]
+
+    except Exception as e:
+        print(f"{R}[-] Attach فشل: {e}{RESET}")
+        return None
+
+
+def step_6_extract_token():
+    """الخطوة 6: سحب التوكن"""
+    print(f"\n{B}{'=' * 55}{RESET}")
+    print(f"{B}  الخطوة 6: سحب التوكن من تطبيق عين العراق{RESET}")
+    print(f"{B}{'=' * 55}{RESET}\n")
+
+    # اختيار السكربت — تجاوز كشف المحاكي تلقائياً على الأجهزة السحابية
+    use_bypass = os.path.exists(BYPASS_SCRIPT)
+    script_to_use = BYPASS_SCRIPT if use_bypass else FRIDA_SCRIPT
+
+    if not os.path.exists(script_to_use):
+        print(f"{R}[-] ملف السكربت غير موجود!{RESET}")
+        return False
+
+    if use_bypass:
+        print(f"{G}[+] سيتم استخدام سكربت تجاوز كشف المحاكي والروت تلقائياً{RESET}")
+        print(f"{C}[*] هذا يمنع التطبيق من كشف الجهاز السحابي كمحاكي أو مروّت{RESET}")
+    else:
+        print(f"{Y}[!] سكربت تجاوز المحاكي غير موجود — سيتم استخدام السكربت العادي{RESET}")
+
+    # التحقق من اتصال ADB
+    ensure_adb_connected()
+
+    # === وضع Gadget (بدون root) ===
+    if GADGET_MODE:
+        print(f"\n{G}[*] === وضع Frida Gadget (بدون root) ==={RESET}")
+        print(f"{C}[*] التطبيق المعدّل يحتوي على Gadget — التجاوز يحمّل تلقائياً{RESET}")
+
+        # إيقاف التطبيق أولاً
+        adb_cmd("shell", f"am force-stop {PACKAGE_NAME}")
+        time.sleep(1)
+
+        result = _extract_with_gadget(script_to_use)
+        if result:
+            return _save_token()
+
+        # Gadget فشل — نجرب تشغيل بدون Gadget (ممكن ينجح)
+        print(f"{Y}[!] Gadget ما اتصل — بنجرب نشغل التطبيق بشكل عادي{RESET}")
+
+    # إيقاف التطبيق أولاً لضمان تحميل التجاوز من البداية
+    print(f"{C}[*] جاري إيقاف التطبيق (إذا شغال)...{RESET}")
+    adb_cmd("shell", f"am force-stop {PACKAGE_NAME}")
+    time.sleep(1)
+
+    # === الأولوية 1: Python Frida API (أقوى وأضمن) ===
+    print(f"\n{C}[*] === محاولة Python Frida API ==={RESET}")
+    result = _frida_spawn_python(script_to_use)
+
+    token_found = False
+    if result is True:
+        token_found = True
+    elif result is None:
+        # Python API فشل — نجرب CLI كـ fallback
+        print(f"\n{C}[*] === محاولة Frida CLI ==={RESET}")
+
+        # Fallback: CLI مع attach mode (نفتح التطبيق أولاً)
+        _launch_app()
+        time.sleep(2)
+
+        if DEVICE_SERIAL:
+            frida_cmd = ["frida", "-D", DEVICE_SERIAL, "-n", PACKAGE_NAME, "-l", script_to_use]
+        else:
+            frida_cmd = ["frida", "-U", "-n", PACKAGE_NAME, "-l", script_to_use]
+
+        print(f"{C}[*] Frida CLI attach mode...{RESET}")
+        print(f"{Y}[*] اضغط Ctrl+C لإيقاف المراقبة{RESET}\n")
+
+        try:
+            process = subprocess.Popen(
+                frida_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True
+            )
+
+            for line in process.stdout:
+                print(line, end="")
+                if "APP CHECK TOKEN" in line or "eyJ" in line:
+                    token_found = True
+                    print(f"\n{G}[+] تم رصد التوكن!{RESET}")
+
+        except KeyboardInterrupt:
+            print(f"\n{Y}[*] تم إيقاف المراقبة{RESET}")
+            try:
+                process.terminate()
+            except Exception:
+                pass
+
+    return _save_token() or token_found
+
+
+def _save_token():
+    """محاولة سحب وحفظ التوكن"""
+    time.sleep(1)
+    result = adb_cmd("pull", TOKEN_FILE_ON_DEVICE, LOCAL_TOKEN_FILE)
+    if result and result.returncode == 0 and os.path.exists(LOCAL_TOKEN_FILE):
+        with open(LOCAL_TOKEN_FILE, "r") as f:
+            token = f.read().strip()
+        if token:
+            print(f"\n{G}{'=' * 60}{RESET}")
+            print(f"{G}  تم سحب التوكن بنجاح!{RESET}")
+            print(f"{G}{'=' * 60}{RESET}")
+            print(f"\n{B}التوكن (أول 100 حرف):{RESET}")
+            print(f"{token[:100]}...")
+            print(f"\n{C}التوكن الكامل محفوظ في:{RESET}")
+            print(f"{C}  {LOCAL_TOKEN_FILE}{RESET}")
+            print(f"{G}{'=' * 60}{RESET}")
+
+            # نسخ للحافظة
+            try:
+                if sys.platform == "win32":
+                    subprocess.run(["clip"], input=token.encode(), check=True)
+                    print(f"{G}[+] تم نسخ التوكن للحافظة!{RESET}")
+                elif sys.platform == "darwin":
+                    subprocess.run(["pbcopy"], input=token.encode(), check=True)
+                    print(f"{G}[+] تم نسخ التوكن للحافظة!{RESET}")
+            except Exception:
+                pass
+
+            return True
+
+    print(f"\n{Y}[-] ما تم العثور على التوكن{RESET}")
+    print(f"{Y}    تأكد من:{RESET}")
+    print(f"{Y}    1. التطبيق فتح بشكل طبيعي (بدون crash){RESET}")
+    print(f"{Y}    2. سويت عملية تتطلب اتصال بالسيرفر{RESET}")
+    if GADGET_MODE:
+        print(f"{Y}    3. التطبيق المعدّل مثبت (الخطوة 5b){RESET}")
+        print(f"{Y}    4. Gadget يحتاج وقت — انتظر 10 ثواني بعد فتح التطبيق{RESET}")
+    else:
+        print(f"{Y}    3. Frida Server شغال بصلاحيات root{RESET}")
+        print(f"{Y}    4. راجع سجل الأخطاء أعلاه لمعرفة سبب الفشل{RESET}")
+
+    return False
+
+
+def step_7_cleanup(instance_name):
+    """الخطوة 7: إيقاف الجهاز (اختياري)"""
+    print(f"\n{B}{'=' * 55}{RESET}")
+    print(f"{B}  الخطوة 7: تنظيف{RESET}")
+    print(f"{B}{'=' * 55}{RESET}\n")
+
+    stop = input(f"{Y}هل تريد إيقاف الجهاز السحابي (لتوفير التكلفة)؟ (y/n): {RESET}").strip().lower()
+    if stop == 'y' and instance_name:
+        print(f"{C}[*] جاري إيقاف الجهاز...{RESET}")
+        # نحتاج UUID مش الاسم
+        result = run_cmd(["gmsaas", "instances", "list"])
+        if result:
+            print(f"{Y}[!] أوقف الجهاز يدوياً من الداشبورد:{RESET}")
+            print(f"{C}    https://cloud.geny.io{RESET}")
+            print(f"{C}    أو: gmsaas instances stop <INSTANCE_UUID>{RESET}")
+    else:
+        print(f"{Y}[!] الجهاز مازال شغال — أوقفه من الداشبورد لتوفير التكلفة{RESET}")
+        print(f"{C}    https://cloud.geny.io{RESET}")
+
+
+def main():
+    print_banner()
+
+    print(f"{C}هذا السكربت يساعدك تسحب توكن AppCheck من تطبيق عين العراق{RESET}")
+    print(f"{C}باستخدام جهاز أندرويد سحابي من Genymotion Cloud{RESET}")
+    print(f"{C}يدعم الأجهزة المروّتة وغير المروّتة (Frida Gadget){RESET}")
+    print(f"\n{Y}التكلفة: ~$0.05/دقيقة (Pay-as-you-go){RESET}")
+    print(f"{Y}الوقت المتوقع: 10-15 دقيقة{RESET}\n")
+
+    choice = input(f"{Y}هل تريد البدء؟ (y/n): {RESET}").strip().lower()
+    if choice != 'y':
+        print(f"{C}مع السلامة!{RESET}")
+        return
+
+    # الخطوة 0: المتطلبات
+    if not step_0_check_requirements():
+        return
+
+    # الخطوة 1: إعداد gmsaas
+    if not step_1_setup_gmsaas():
+        return
+
+    # تهيئة SDK
+    step_1b_configure_sdk()
+
+    # الخطوة 2: تشغيل جهاز
+    instance_name = step_2_start_device()
+    if not instance_name:
+        return
+
+    # الخطوة 3: ربط ADB
+    if not step_3_connect_adb(instance_name):
+        return
+
+    # الخطوة 4: تنصيب التطبيق
+    step_4_install_app()
+
+    # الخطوة 5: كشف Root وإعداد Frida
+    has_root = _detect_root_shell()
+
+    if has_root:
+        # الجهاز مروّت — نستخدم frida-server (الطريقة الكلاسيكية)
+        print(f"\n{G}[+] الجهاز مروّت — نستخدم Frida Server{RESET}")
+        if not step_5_install_frida_server():
+            print(f"\n{R}[-] فشل تنصيب/تشغيل Frida Server{RESET}")
+            print(f"{Y}    بنجرب وضع Gadget كحل بديل...{RESET}")
+            # Fallback to Gadget even if root exists but frida-server fails
+            global GADGET_MODE
+            GADGET_MODE = True
+            if not step_5b_patch_apk_gadget():
+                print(f"\n{R}[-] فشل كل الطرق — ما نقدر نكمل{RESET}")
+                step_7_cleanup(instance_name)
+                return
+    else:
+        # الجهاز مش مروّت — نستخدم Frida Gadget
+        print(f"\n{Y}[!] الجهاز غير مروّت — نستخدم Frida Gadget{RESET}")
+        if not step_5b_patch_apk_gadget():
+            print(f"\n{R}[-] فشل حقن Frida Gadget — ما نقدر نكمل{RESET}")
+            print(f"{Y}    تأكد إن التطبيق منصب وإن Android SDK موجود{RESET}")
+            step_7_cleanup(instance_name)
+            return
+
+    # الخطوة 6: سحب التوكن
+    step_6_extract_token()
+
+    # الخطوة 7: تنظيف
+    step_7_cleanup(instance_name)
+
+    print(f"\n{C}انتهينا! إذا واجهت مشاكل راجع README.md{RESET}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print(f"\n{Y}تم الإيقاف{RESET}")

@@ -366,6 +366,9 @@ private fun AppScreen() {
     var blockedNotice by rememberSaveable { mutableStateOf("") }
     var accessValidationRunning by remember { mutableStateOf(false) }
     var lastValidatedToken by remember { mutableStateOf("") }
+    var fetchAdminKey by rememberSaveable { mutableStateOf("") }
+    var fetchServerUrl by rememberSaveable { mutableStateOf("") }
+    var fetchingAppCheck by remember { mutableStateOf(false) }
     var useAccountAppCheckOverride by rememberSaveable { mutableStateOf(false) }
     var accountAppCheckOverride by rememberSaveable { mutableStateOf("") }
     var useAccountProxyOverride by rememberSaveable { mutableStateOf(false) }
@@ -425,6 +428,7 @@ private fun AppScreen() {
 
     val api = AyniqApi { currentSettings }
     val gateApi = remember { GateApi() }
+    val appCheckFetcher = remember { AppCheckFetcher() }
     val bookingEngine = remember(api) { BookingEngine(api) }
 
     var phone by rememberSaveable { mutableStateOf("") }
@@ -728,6 +732,48 @@ private fun AppScreen() {
                                 "لو كنت تستخدم SOAX: ضع Host و Port و Username و Password في قسم البروكسي فقط. AppCheck غالبًا يبدأ بـ eyJ...",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Button(
+                                onClick = {
+                                    scope.launch {
+                                        if (fetchAdminKey.isBlank()) {
+                                            snackbarHost.showSnackbar("أدخل مفتاح الأدمن أولاً لسحب التوكن")
+                                            return@launch
+                                        }
+                                        fetchingAppCheck = true
+                                        appCheckFetcher.fetchAppCheckToken(
+                                            customServerUrl = fetchServerUrl.ifBlank { null },
+                                            customAdminKey = fetchAdminKey
+                                        ).onSuccess { token ->
+                                            appCheck = token
+                                            snackbarHost.showSnackbar("تم سحب AppCheck بنجاح من السيرفر")
+                                        }.onFailure { err ->
+                                            snackbarHost.showSnackbar(err.message ?: "فشل سحب التوكن")
+                                        }
+                                        fetchingAppCheck = false
+                                    }
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(16.dp),
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF059669)),
+                                enabled = !fetchingAppCheck
+                            ) {
+                                Text(if (fetchingAppCheck) "جاري السحب..." else "سحب AppCheck من السيرفر")
+                            }
+                            OutlinedTextField(
+                                value = fetchAdminKey,
+                                onValueChange = { fetchAdminKey = it },
+                                label = { Text("مفتاح الأدمن (Admin Key)") },
+                                supportingText = { Text("المفتاح الذي وضعته في إعدادات سيرفر التحكم") },
+                                visualTransformation = PasswordVisualTransformation(),
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                            OutlinedTextField(
+                                value = fetchServerUrl,
+                                onValueChange = { fetchServerUrl = it },
+                                label = { Text("رابط السيرفر (اختياري)") },
+                                supportingText = { Text("اتركه فارغ لاستخدام السيرفر الافتراضي") },
+                                modifier = Modifier.fillMaxWidth()
                             )
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 Text("البروكسي اليدوي", fontWeight = FontWeight.Medium)
