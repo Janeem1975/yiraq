@@ -54,8 +54,9 @@ def print_banner():
 """)
 
 
-# متغير عام لحفظ سريال الجهاز المستهدف
+# متغيرات عامة
 DEVICE_SERIAL = None
+INSTANCE_NAME = None  # UUID الجهاز السحابي لإعادة الاتصال
 
 
 def run_cmd(cmd, capture=True, timeout=30):
@@ -78,6 +79,63 @@ def adb_cmd(*args, timeout=30):
         cmd.extend(["-s", DEVICE_SERIAL])
     cmd.extend(args)
     return run_cmd(cmd, timeout=timeout)
+
+
+def ensure_adb_connected():
+    """التحقق من اتصال ADB وإعادة الاتصال إذا انقطع"""
+    global DEVICE_SERIAL
+
+    if not DEVICE_SERIAL:
+        return True
+
+    # فحص سريع: هل الجهاز متصل؟
+    result = run_cmd(["adb", "devices"])
+    if result and DEVICE_SERIAL in result.stdout and "device" in result.stdout:
+        # تحقق إضافي: هل يستجيب فعلاً؟
+        test = adb_cmd("shell", "echo", "ok", timeout=5)
+        if test and test.returncode == 0 and "ok" in test.stdout:
+            return True
+
+    print(f"{Y}[!] اتصال ADB انقطع — جاري إعادة الاتصال...{RESET}")
+
+    # إعادة الاتصال عبر gmsaas
+    if INSTANCE_NAME:
+        result = run_cmd(["gmsaas", "instances", "adbconnect", INSTANCE_NAME], timeout=60)
+        if result and result.returncode == 0:
+            output = result.stdout.strip()
+            print(f"{G}[+] تم إعادة الاتصال!{RESET}")
+            # تحديث السريال إذا تغيّر
+            for line in output.split('\n'):
+                line = line.strip()
+                for part in line.split():
+                    if 'localhost:' in part:
+                        DEVICE_SERIAL = part
+                        break
+            time.sleep(2)
+            # تحقق نهائي
+            test = adb_cmd("shell", "echo", "ok", timeout=5)
+            if test and test.returncode == 0:
+                print(f"{G}[+] الجهاز متصل: {DEVICE_SERIAL}{RESET}")
+                return True
+
+    # محاولة adb connect مباشر
+    if DEVICE_SERIAL and 'localhost:' in DEVICE_SERIAL:
+        run_cmd(["adb", "connect", DEVICE_SERIAL], timeout=10)
+        time.sleep(2)
+        test = adb_cmd("shell", "echo", "ok", timeout=5)
+        if test and test.returncode == 0:
+            print(f"{G}[+] تم إعادة الاتصال بـ {DEVICE_SERIAL}{RESET}")
+            return True
+
+    print(f"{R}[-] فشل إعادة اتصال ADB{RESET}")
+    print(f"{Y}    جرب يدوياً:{RESET}")
+    print(f"{C}    gmsaas instances adbconnect {INSTANCE_NAME or '<UUID>'}{RESET}")
+    retry = input(f"{Y}اضغط Enter بعد إعادة الاتصال يدوياً (أو 'q' للإلغاء): {RESET}").strip()
+    if retry.lower() == 'q':
+        return False
+    # فحص أخير
+    test = adb_cmd("shell", "echo", "ok", timeout=5)
+    return test is not None and test.returncode == 0
 
 
 def check_tool(name, install_cmd=None):
@@ -287,7 +345,8 @@ def step_2_start_device():
 
 def step_3_connect_adb(instance_name):
     """الخطوة 3: ربط ADB بالجهاز السحابي"""
-    global DEVICE_SERIAL
+    global DEVICE_SERIAL, INSTANCE_NAME
+    INSTANCE_NAME = instance_name
 
     print(f"\n{B}{'=' * 55}{RESET}")
     print(f"{B}  الخطوة 3: ربط ADB بالجهاز السحابي{RESET}")
@@ -352,17 +411,46 @@ def step_3_connect_adb(instance_name):
 
 def step_4_install_app():
     """الخطوة 4: تنصيب تطبيق عين العراق"""
+    global PACKAGE_NAME
+
     print(f"\n{B}{'=' * 55}{RESET}")
     print(f"{B}  الخطوة 4: تنصيب تطبيق عين العراق{RESET}")
     print(f"{B}{'=' * 55}{RESET}\n")
 
+    # عرض التطبيقات المنصبة عشان المستخدم يلاقي اسم الحزمة
+    print(f"{C}[*] جاري جلب قائمة التطبيقات المنصبة...{RESET}")
+    result = adb_cmd("shell", "pm", "list", "packages", "-3")  # -3 = third party only
+    installed_packages = []
+    if result and result.returncode == 0 and result.stdout.strip():
+        lines = result.stdout.strip().split('\n')
+        installed_packages = [l.replace('package:', '').strip() for l in lines if l.strip()]
+        print(f"{G}[+] التطبيقات المنصبة ({len(installed_packages)}):{RESET}")
+        for pkg in installed_packages:
+            marker = " ← عين العراق" if "ayniq" in pkg.lower() or "moi" in pkg.lower() else ""
+            print(f"{C}    • {pkg}{G}{marker}{RESET}")
+    else:
+        print(f"{Y}[!] ما قدرت أجلب قائمة التطبيقات{RESET}")
+
     # التحقق هل التطبيق موجود
     result = adb_cmd("shell", "pm", "list", "packages", PACKAGE_NAME)
     if result and PACKAGE_NAME in result.stdout:
-        print(f"{G}[+] تطبيق عين العراق موجود مسبقاً!{RESET}")
+        print(f"\n{G}[+] تطبيق عين العراق ({PACKAGE_NAME}) موجود!{RESET}")
         return True
 
-    print(f"{C}[*] التطبيق مش منصب — لازم تنصبه{RESET}")
+    # التطبيق مش موجود — يمكن باسم ثاني؟
+    ayniq_matches = [p for p in installed_packages if "ayniq" in p.lower() or "moi" in p.lower()]
+    if ayniq_matches:
+        print(f"\n{Y}[!] التطبيق مش موجود بالاسم {PACKAGE_NAME}{RESET}")
+        print(f"{G}[+] بس لقيت تطبيقات مشابهة:{RESET}")
+        for i, pkg in enumerate(ayniq_matches, 1):
+            print(f"{C}    {i}. {pkg}{RESET}")
+        choice = input(f"{Y}اختر رقم التطبيق (أو Enter لتخطي): {RESET}").strip()
+        if choice.isdigit() and 1 <= int(choice) <= len(ayniq_matches):
+            PACKAGE_NAME = ayniq_matches[int(choice) - 1]
+            print(f"{G}[+] تم تغيير اسم الحزمة إلى: {PACKAGE_NAME}{RESET}")
+            return True
+
+    print(f"\n{Y}[!] التطبيق ({PACKAGE_NAME}) مش منصب{RESET}")
     print(f"""
 {Y}الخيارات:{RESET}
 {C}  1. نزّل التطبيق من Google Play مباشرة على الجهاز السحابي{RESET}
@@ -372,15 +460,29 @@ def step_4_install_app():
 {C}  3. نزّل الـ APK من:{RESET}
 {C}     - https://apkpure.com (ابحث عن عين العراق){RESET}
 {C}     - https://apkmirror.com{RESET}
+{C}  4. إذا التطبيق باسم حزمة ثاني — أدخله يدوياً{RESET}
 """)
 
-    apk_path = input(f"{Y}أدخل مسار ملف APK (أو Enter لتخطي إذا نزّلته من Google Play): {RESET}").strip()
-    if apk_path:
-        # إزالة علامات التنصيص إذا موجودة
-        apk_path = apk_path.strip('"').strip("'")
-        if os.path.exists(apk_path):
+    user_input = input(f"{Y}أدخل مسار APK / اسم حزمة / Enter لتخطي: {RESET}").strip()
+    if user_input:
+        user_input = user_input.strip('"').strip("'")
+        # هل هو اسم حزمة؟
+        if '.' in user_input and not os.path.exists(user_input) and '/' not in user_input and '\\' not in user_input:
+            PACKAGE_NAME = user_input
+            print(f"{G}[+] تم تغيير اسم الحزمة إلى: {PACKAGE_NAME}{RESET}")
+            # تحقق
+            result = adb_cmd("shell", "pm", "list", "packages", PACKAGE_NAME)
+            if result and PACKAGE_NAME in result.stdout:
+                print(f"{G}[+] التطبيق موجود!{RESET}")
+                return True
+            else:
+                print(f"{Y}[!] الحزمة غير موجودة — بنكمل على أمل إنك تنصبها{RESET}")
+                return True  # نكمل عشان يقدر ينصب من Google Play
+        # هل هو ملف APK؟
+        elif os.path.exists(user_input):
             print(f"{C}[*] جاري تنصيب التطبيق...{RESET}")
-            result = adb_cmd("install", apk_path, timeout=120)
+            ensure_adb_connected()
+            result = adb_cmd("install", user_input, timeout=120)
             if result and result.returncode == 0:
                 print(f"{G}[+] تم تنصيب التطبيق بنجاح!{RESET}")
                 return True
@@ -390,15 +492,24 @@ def step_4_install_app():
                     print(f"{R}    {result.stderr}{RESET}")
                 return False
         else:
-            print(f"{R}[-] الملف غير موجود: {apk_path}{RESET}")
+            print(f"{R}[-] الملف غير موجود: {user_input}{RESET}")
             return False
     else:
-        # التحقق مرة ثانية بعد التخطي (يمكن نزّله من Google Play)
+        # تخطي — التحقق مرة أخيرة
         result = adb_cmd("shell", "pm", "list", "packages", PACKAGE_NAME)
         if result and PACKAGE_NAME in result.stdout:
             print(f"{G}[+] تطبيق عين العراق موجود الآن!{RESET}")
             return True
-        print(f"{Y}[!] تم التخطي — نصّب التطبيق من Google Play أو بملف APK وأعد التشغيل{RESET}")
+
+        print(f"{Y}[!] التطبيق مش منصب بعد{RESET}")
+        print(f"{Y}    نصبه من Google Play أو بملف APK ثم اضغط Enter{RESET}")
+        input(f"{Y}اضغط Enter بعد التنصيب... {RESET}")
+
+        result = adb_cmd("shell", "pm", "list", "packages", PACKAGE_NAME)
+        if result and PACKAGE_NAME in result.stdout:
+            print(f"{G}[+] تطبيق عين العراق موجود!{RESET}")
+            return True
+        print(f"{R}[-] التطبيق مازال غير موجود{RESET}")
         return False
 
 
@@ -543,6 +654,11 @@ def step_5_install_frida_server():
     adb_cmd("shell", "su", "-c", "pkill -f frida-server 2>/dev/null")
     time.sleep(1)
 
+    # إعادة اتصال ADB (قد ينقطع أثناء التنزيل اليدوي)
+    if not ensure_adb_connected():
+        print(f"{R}[-] ADB غير متصل — ما نقدر ندفع Frida Server{RESET}")
+        return False
+
     # دفع Frida Server للجهاز
     print(f"{C}[*] جاري دفع Frida Server للجهاز...{RESET}")
     result = adb_cmd("push", frida_local, "/data/local/tmp/frida-server", timeout=120)
@@ -550,7 +666,17 @@ def step_5_install_frida_server():
         print(f"{R}[-] فشل دفع الملف{RESET}")
         if result:
             print(f"{R}    {result.stderr}{RESET}")
-        return False
+        # محاولة إعادة اتصال ثم إعادة المحاولة
+        print(f"{Y}[!] جاري إعادة اتصال ADB ومحاولة ثانية...{RESET}")
+        if ensure_adb_connected():
+            result = adb_cmd("push", frida_local, "/data/local/tmp/frida-server", timeout=120)
+            if result and result.returncode == 0:
+                print(f"{G}[+] تم دفع الملف بعد إعادة الاتصال!{RESET}")
+            else:
+                print(f"{R}[-] فشل مرة ثانية{RESET}")
+                return False
+        else:
+            return False
 
     print(f"{G}[+] تم دفع الملف!{RESET}")
 
@@ -654,6 +780,9 @@ def step_6_extract_token():
         print(f"{C}[*] هذا يمنع التطبيق من كشف الجهاز السحابي كمحاكي{RESET}")
     else:
         print(f"{Y}[!] سكربت تجاوز المحاكي غير موجود — سيتم استخدام السكربت العادي{RESET}")
+
+    # التحقق من اتصال ADB
+    ensure_adb_connected()
 
     # إيقاف التطبيق أولاً لضمان تحميل التجاوز من البداية
     print(f"{C}[*] جاري إيقاف التطبيق (إذا شغال)...{RESET}")
