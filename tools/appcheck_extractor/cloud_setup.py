@@ -659,70 +659,207 @@ def step_5_install_frida_server():
     frida_xz = f"{frida_filename}.xz"
     frida_local = os.path.join(tempfile.gettempdir(), frida_filename)
 
+    # البحث عن الملف في مجلدات معروفة (Downloads, Desktop, Temp, مجلد السكربت)
+    def _find_frida_file(filename, xz_name):
+        """يبحث عن ملف frida-server في المجلدات الشائعة"""
+        search_dirs = [tempfile.gettempdir()]
+        if sys.platform == "win32":
+            home = os.path.expanduser("~")
+            search_dirs.extend([
+                os.path.join(home, "Downloads"),
+                os.path.join(home, "Desktop"),
+                home,
+                os.path.dirname(os.path.abspath(__file__)),
+                os.getcwd(),
+            ])
+        else:
+            search_dirs.extend([
+                os.path.expanduser("~/Downloads"),
+                os.path.dirname(os.path.abspath(__file__)),
+                os.getcwd(),
+            ])
+
+        for d in search_dirs:
+            if not os.path.isdir(d):
+                continue
+            # أولاً نبحث عن الملف المفكوك
+            candidate = os.path.join(d, filename)
+            if os.path.exists(candidate) and os.path.getsize(candidate) > 1_000_000:
+                return candidate
+            # ثم نبحث عن الملف المضغوط
+            candidate_xz = os.path.join(d, xz_name)
+            if os.path.exists(candidate_xz):
+                return candidate_xz
+        return None
+
+    if not os.path.exists(frida_local):
+        # أولاً: نبحث في المجلدات المعروفة (Downloads, Desktop, ...)
+        found = _find_frida_file(frida_filename, frida_xz)
+        if found:
+            print(f"{G}[+] لقيت الملف تلقائياً: {found}{RESET}")
+            if found.endswith('.xz'):
+                print(f"{C}[*] جاري فك الضغط...{RESET}")
+                try:
+                    import lzma
+                    with lzma.open(found) as f_in:
+                        with open(frida_local, 'wb') as f_out:
+                            f_out.write(f_in.read())
+                    print(f"{G}[+] تم فك الضغط!{RESET}")
+                except Exception as ex:
+                    print(f"{Y}[!] فشل فك الضغط التلقائي: {ex}{RESET}")
+                    found = None
+            else:
+                frida_local = found
+
     if not os.path.exists(frida_local):
         # تنزيل frida-server
         download_url = f"https://github.com/frida/frida/releases/download/{FRIDA_VERSION}/{frida_xz}"
         print(f"{C}[*] جاري تنزيل Frida Server...{RESET}")
         print(f"{C}    {download_url}{RESET}")
 
+        downloaded = False
+
+        # الطريقة 1: Python urllib
         try:
             import urllib.request
             xz_path = os.path.join(tempfile.gettempdir(), frida_xz)
             urllib.request.urlretrieve(download_url, xz_path)
             print(f"{G}[+] تم التنزيل!{RESET}")
-
-            # فك الضغط
-            print(f"{C}[*] جاري فك الضغط...{RESET}")
-            if sys.platform == "win32":
-                # على Windows نستخدم 7z أو Python lzma
-                import lzma
-                with lzma.open(xz_path) as f_in:
-                    with open(frida_local, 'wb') as f_out:
-                        f_out.write(f_in.read())
-            else:
-                subprocess.run(["unxz", "-k", xz_path], check=True)
-                # الملف المفكوك يكون بدون .xz
-                unxz_path = xz_path.replace(".xz", "")
-                if os.path.exists(unxz_path) and unxz_path != frida_local:
-                    shutil.move(unxz_path, frida_local)
-
-            print(f"{G}[+] تم فك الضغط!{RESET}")
+            downloaded = True
         except Exception as e:
-            print(f"{R}[-] فشل التنزيل: {e}{RESET}")
+            print(f"{Y}[!] فشل التنزيل بـ Python: {e}{RESET}")
+
+        # الطريقة 2: PowerShell (على Windows)
+        if not downloaded and sys.platform == "win32":
+            print(f"{C}[*] جاري المحاولة بـ PowerShell...{RESET}")
+            xz_path = os.path.join(tempfile.gettempdir(), frida_xz)
+            ps_cmd = (
+                f'powershell -Command "'
+                f"[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; "
+                f"Invoke-WebRequest -Uri '{download_url}' -OutFile '{xz_path}'"
+                f'"'
+            )
+            try:
+                ps_result = subprocess.run(ps_cmd, shell=True, capture_output=True, text=True, timeout=120)
+                if ps_result.returncode == 0 and os.path.exists(xz_path) and os.path.getsize(xz_path) > 100_000:
+                    print(f"{G}[+] تم التنزيل بـ PowerShell!{RESET}")
+                    downloaded = True
+                else:
+                    err = (ps_result.stderr or "").strip()
+                    print(f"{Y}[!] فشل PowerShell: {err[:200]}{RESET}")
+            except Exception as e2:
+                print(f"{Y}[!] فشل PowerShell: {e2}{RESET}")
+
+        # الطريقة 3: curl (متوفر على Windows 10+ و Linux)
+        if not downloaded:
+            print(f"{C}[*] جاري المحاولة بـ curl...{RESET}")
+            xz_path = os.path.join(tempfile.gettempdir(), frida_xz)
+            try:
+                curl_result = subprocess.run(
+                    ["curl", "-L", "-o", xz_path, download_url],
+                    capture_output=True, text=True, timeout=120
+                )
+                if curl_result.returncode == 0 and os.path.exists(xz_path) and os.path.getsize(xz_path) > 100_000:
+                    print(f"{G}[+] تم التنزيل بـ curl!{RESET}")
+                    downloaded = True
+                else:
+                    print(f"{Y}[!] فشل curl{RESET}")
+            except Exception as e3:
+                print(f"{Y}[!] curl غير متوفر: {e3}{RESET}")
+
+        if downloaded:
+            # فك الضغط
+            xz_path = os.path.join(tempfile.gettempdir(), frida_xz)
+            print(f"{C}[*] جاري فك الضغط...{RESET}")
+            try:
+                if sys.platform == "win32":
+                    import lzma
+                    with lzma.open(xz_path) as f_in:
+                        with open(frida_local, 'wb') as f_out:
+                            f_out.write(f_in.read())
+                else:
+                    subprocess.run(["unxz", "-k", xz_path], check=True)
+                    unxz_path = xz_path.replace(".xz", "")
+                    if os.path.exists(unxz_path) and unxz_path != frida_local:
+                        shutil.move(unxz_path, frida_local)
+                print(f"{G}[+] تم فك الضغط!{RESET}")
+            except Exception as e:
+                print(f"{R}[-] فشل فك الضغط: {e}{RESET}")
+                downloaded = False
+
+        if not downloaded or not os.path.exists(frida_local):
             print(f"")
-            print(f"{Y}    === تعليمات التنزيل اليدوي ==={RESET}")
-            print(f"{C}    1. افتح هذا الرابط بالمتصفح:{RESET}")
-            print(f"{B}       https://github.com/frida/frida/releases/download/{FRIDA_VERSION}/{frida_xz}{RESET}")
-            print(f"{C}    2. بعد التنزيل، فك الضغط بـ 7-Zip:{RESET}")
-            print(f"{C}       كلك يمين على الملف → 7-Zip → Extract Here{RESET}")
-            print(f"{C}    3. المفروض يطلع ملف اسمه: {frida_filename}{RESET}")
-            print(f"{C}       (بدون .xz بالآخر){RESET}")
-            print(f"{C}    4. الصق مسار الملف المفكوك هنا{RESET}")
-            print(f"")
-            print(f"{Y}    ملاحظة: الملف لازم يكون المفكوك (بدون .xz){RESET}")
-            print(f"{Y}    إذا أعطيت ملف .xz بنفكه تلقائياً{RESET}")
-            manual = input(f"{Y}أدخل مسار الملف (أو Enter للإلغاء): {RESET}").strip()
-            if manual:
-                manual = manual.strip('"').strip("'")
-                if not os.path.exists(manual):
-                    print(f"{R}[-] الملف غير موجود: {manual}{RESET}")
-                    return False
-                # إذا الملف بصيغة .xz، نفكه
-                if manual.endswith('.xz'):
+            print(f"{Y}    === التنزيل التلقائي فشل ==={RESET}")
+            print(f"{C}    بنبحث عن الملف تلقائياً بمجلد Downloads...{RESET}")
+
+            # بحث ثاني بعد ما المستخدم ممكن نزّله بالمتصفح
+            found = _find_frida_file(frida_filename, frida_xz)
+            if found:
+                print(f"{G}[+] لقيناه! {found}{RESET}")
+                if found.endswith('.xz'):
                     print(f"{C}[*] جاري فك الضغط...{RESET}")
                     try:
                         import lzma
-                        with lzma.open(manual) as f_in:
+                        with lzma.open(found) as f_in:
                             with open(frida_local, 'wb') as f_out:
                                 f_out.write(f_in.read())
                         print(f"{G}[+] تم فك الضغط!{RESET}")
                     except Exception as ex:
                         print(f"{R}[-] فشل فك الضغط: {ex}{RESET}")
-                        return False
+                        found = None
                 else:
-                    frida_local = manual
-            else:
-                return False
+                    frida_local = found
+
+            if not found or not os.path.exists(frida_local):
+                print(f"")
+                print(f"{Y}    === تعليمات التنزيل اليدوي ==={RESET}")
+                print(f"{C}    1. افتح هذا الرابط بالمتصفح:{RESET}")
+                print(f"{B}       {download_url}{RESET}")
+                print(f"{C}    2. بعد التنزيل، الملف بينحفظ بمجلد Downloads{RESET}")
+                print(f"{C}    3. اضغط Enter — السكربت بيلاقيه تلقائياً{RESET}")
+                print(f"{C}    أو: الصق مسار الملف يدوياً{RESET}")
+                print(f"")
+                manual = input(f"{Y}اضغط Enter (بحث تلقائي) أو الصق المسار: {RESET}").strip()
+
+                if manual:
+                    manual = manual.strip('"').strip("'")
+                    if not os.path.exists(manual):
+                        print(f"{R}[-] الملف غير موجود: {manual}{RESET}")
+                        return False
+                    if manual.endswith('.xz'):
+                        print(f"{C}[*] جاري فك الضغط...{RESET}")
+                        try:
+                            import lzma
+                            with lzma.open(manual) as f_in:
+                                with open(frida_local, 'wb') as f_out:
+                                    f_out.write(f_in.read())
+                            print(f"{G}[+] تم فك الضغط!{RESET}")
+                        except Exception as ex:
+                            print(f"{R}[-] فشل فك الضغط: {ex}{RESET}")
+                            return False
+                    else:
+                        frida_local = manual
+                else:
+                    # بحث تلقائي بعد ما المستخدم نزّل الملف
+                    found = _find_frida_file(frida_filename, frida_xz)
+                    if found:
+                        print(f"{G}[+] لقيناه! {found}{RESET}")
+                        if found.endswith('.xz'):
+                            print(f"{C}[*] جاري فك الضغط...{RESET}")
+                            try:
+                                import lzma
+                                with lzma.open(found) as f_in:
+                                    with open(frida_local, 'wb') as f_out:
+                                        f_out.write(f_in.read())
+                                print(f"{G}[+] تم فك الضغط!{RESET}")
+                            except Exception as ex:
+                                print(f"{R}[-] فشل فك الضغط: {ex}{RESET}")
+                                return False
+                        else:
+                            frida_local = found
+                    else:
+                        print(f"{R}[-] ما لقيت الملف — جرّب تنزله وشغّل السكربت مرة ثانية{RESET}")
+                        return False
 
     # التحقق من حجم الملف (frida-server عادة > 10MB)
     file_size = os.path.getsize(frida_local)
